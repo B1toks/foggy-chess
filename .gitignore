@@ -24,6 +24,12 @@
 .DS_Store
 *.pem
 
+# Full-resolution source art. public/textures/mountains.jpg is the derived,
+# shipped copy (2560px, 434 KB); this is the 6.6 MB original it came from and
+# nothing in the build reads it. Kept out of git so it does not sit in history
+# forever — back it up somewhere else if you want to re-derive the texture.
+/assets-src/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
@@ -39,3 +45,5 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.vercel
