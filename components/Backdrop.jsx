@@ -3,6 +3,8 @@ import * as THREE from 'three';
 import { useThree } from '@react-three/fiber';
 import { useTexture } from '@react-three/drei';
 import Mountains from './Mountains';
+import SkyDome, { DOME_HORIZON_COLOR } from './SkyDome';
+import { getBackdropEdgeAlphaMap } from './proceduralTextures';
 import { basePositionFor } from './CameraRig';
 
 /*
@@ -88,9 +90,17 @@ export const AZIMUTH_SWING = THREE.MathUtils.degToRad(30);
  * the visible band ~63, so [44, 96] fades that band from 0.28 to 0.41 and the
  * seam where the painting meets the plateau never reads as an edge.
  */
+/*
+ * Fog color is the dome's own horizon stop (DOME_HORIZON_COLOR), not a
+ * separately-picked tone. The painting fades out (both from its own alphaMap
+ * and from distance fog) into open dome behind it, and the specific elevation
+ * band where that happens sits close to the dome's horizon stop (see
+ * SkyDome.jsx) — matching the fog color to it exactly removes what would
+ * otherwise be a visible tone seam right where the painting dissolves.
+ */
 export const BACKDROP_FOG = USES_PAINTING
-  ? { color: '#EFEADF', near: 44, far: 96 }
-  : { color: '#EFEADF', near: 26, far: 72 };
+  ? { color: DOME_HORIZON_COLOR, near: 44, far: 96 }
+  : { color: DOME_HORIZON_COLOR, near: 26, far: 72 };
 
 function readTuning() {
   if (typeof window === 'undefined') return {};
@@ -151,6 +161,8 @@ function ImageBackdrop({ src, tuning }) {
     texture.needsUpdate = true;
   }, [texture, tuning.flip]);
 
+  const edgeAlpha = useMemo(getBackdropEdgeAlphaMap, []);
+
   return (
     <mesh position={[0, geo.centerY, 0]} renderOrder={-1}>
       <cylinderGeometry
@@ -159,9 +171,18 @@ function ImageBackdrop({ src, tuning }) {
       {/* Basic, not standard: a painted backdrop must not be re-lit by the
           scene's key/rim, or it picks up highlights that make it read as a
           curved wall rather than distance. Scene fog stays enabled so the
-          lower edge dissolves instead of ending on a visible seam. */}
+          lower edge dissolves further with distance on top of the alphaMap's
+          fixed-shape fade below.
+
+          alphaMap dissolves the painting into whatever is now behind it — the
+          SkyDome — on all four sides: both azimuth edges and the bottom, so
+          there is no seam at any camera position, not just inside the old
+          azimuth clamp. transparent has to be explicit; alphaMap does nothing
+          without it. */}
       <meshBasicMaterial
         map={texture}
+        alphaMap={edgeAlpha}
+        transparent
         side={THREE.BackSide}
         toneMapped={false}
         depthWrite={false}
@@ -187,10 +208,24 @@ export default function Backdrop() {
     };
   }, []);
 
-  if (!USES_PAINTING) return <Mountains />;
+  if (!USES_PAINTING) {
+    return (
+      <>
+        <SkyDome />
+        <Mountains />
+      </>
+    );
+  }
 
   return (
     <>
+      {/* Mounted first and unconditionally: it is what closes the scene on
+          every azimuth, so the painted segment (one frame, not a panorama) has
+          somewhere to dissolve into instead of an edge or open canvas. Ordinary
+          depth testing puts it behind everything else without any renderOrder
+          bookkeeping — it is opaque and by far the largest thing in the
+          scene. */}
+      <SkyDome />
       {imageReady ? <ImageBackdrop src={BACKDROP_IMAGE} tuning={tuning} /> : <Mountains />}
       {/* Mounted on top of the painting, not instead of it. 32 MB takes a while
           and may not arrive at all; the painted cylinder is the floor under it

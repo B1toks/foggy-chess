@@ -166,6 +166,63 @@ export function getPlateauAlphaMap() {
   return plateauAlpha;
 }
 
+let backdropEdgeAlpha = null;
+/**
+ * Edge/bottom fade for the painted backdrop segment, baked to a texture rather
+ * than computed live in a fragment shader. The gradient is a static function
+ * of UV alone — nothing about it is animated or depends on a uniform — so a
+ * baked alphaMap on the existing MeshBasicMaterial produces an identical
+ * result to a custom ShaderMaterial, while keeping MeshBasicMaterial's
+ * built-in scene-fog blending, which the painting already relies on for its
+ * own distance fade.
+ *
+ * Matches CylinderGeometry's UV convention (see node_modules/three's
+ * CylinderGeometry: `uvs.push(u, 1 - v)`, so texture V=1 is the mesh TOP):
+ * both left/right edges fade in over the first/last 12% of U, and V=1 (sky)
+ * stays opaque while V=0 (the mesh bottom, the painting's foreground) fades
+ * out over the first 18% of V. Symmetric in U on purpose, so it does not care
+ * about the diffuse map's own U flip.
+ */
+export function getBackdropEdgeAlphaMap() {
+  if (backdropEdgeAlpha) return backdropEdgeAlpha;
+
+  const size = 256;
+  const canvas = makeCanvas(size);
+  const ctx = canvas.getContext('2d');
+  const image = ctx.createImageData(size, size);
+  const data = image.data;
+
+  const smoothstep = (edge0, edge1, x) => {
+    const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+  };
+
+  for (let py = 0; py < size; py++) {
+    // CanvasTexture keeps flipY (the default, same as an image texture), so
+    // canvas row 0 (top) is texture V=1 and row size-1 (bottom) is V=0.
+    const v = 1 - py / (size - 1);
+    const bottomFade = smoothstep(0, 0.18, v);
+
+    for (let px = 0; px < size; px++) {
+      const u = px / (size - 1);
+      const edgeFade = smoothstep(0, 0.12, u) * smoothstep(1, 0.88, u);
+      const value = Math.round(255 * edgeFade * bottomFade);
+      const i = (py * size + px) * 4;
+      data[i] = value;
+      data[i + 1] = value; // alphaMap reads the green channel
+      data[i + 2] = value;
+      data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+
+  backdropEdgeAlpha = new THREE.CanvasTexture(canvas);
+  backdropEdgeAlpha.wrapS = THREE.ClampToEdgeWrapping;
+  backdropEdgeAlpha.wrapT = THREE.ClampToEdgeWrapping;
+  backdropEdgeAlpha.colorSpace = THREE.NoColorSpace;
+  return backdropEdgeAlpha;
+}
+
 let boardRoughness = null;
 /**
  * Tile surface: fine noise plus faint directional fibres. Roughness only, never

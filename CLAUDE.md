@@ -301,7 +301,8 @@ components/GameCanvas.jsx  — Canvas, camera, lights, OrbitControls; owns useCh
 components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state
 components/PromotionPicker.jsx — 3D piece choices above the promoting square; camera-facing, self-cancelling
 components/Plateau.jsx     — the ground under the board; alpha-dissolved rim (see "Plateau")
-components/proceduralTextures.js — canvas noise -> roughness/normal/alpha maps for the plateau and tiles
+components/SkyDome.jsx     — full sphere behind everything, gradient + faint fbm haze (see "Camera and environment")
+components/proceduralTextures.js — canvas noise -> roughness/normal/alpha maps for the plateau, tiles, backdrop edge fade
 components/audio.js        — synthesised SFX + wind bed, off by default
 components/Pieces.jsx      — maps chess.js cells -> PieceModel; skips opponent pieces outside `visibility`
 components/PieceModel.jsx  — GLTF load + height normalization + material override (see "3D models")
@@ -324,7 +325,55 @@ per square) is kept working as a rollback — do not delete it.
 Tier 2 (`components/FogShader.jsx`) drives an 8x8 `DataTexture` mask through a
 single plane over the board. `LinearFilter` on that mask is what turns
 per-square 0/1 into smooth gradients; without it the fog is a visible grid of
-squares. An fbm value-noise field adds drifting cloud density on top.
+squares.
+
+### Wisp structure (ridged noise, not fbm)
+
+Plain fbm gives soft blobs; the fog is meant to read as fibrous wisps and gaps.
+Each octave is folded around its midpoint (`n = 1.0 - abs(n*2.0-1.0)`, then
+squared) — this turns fbm's zero-crossings into sharp ridges. The function is
+generated per-material by `ridgedGLSL(name, octaves)` (a JS template, not a
+runtime uniform loop bound — GLSL loop counts are simplest as compile-time
+constants, and octave count is a thing a developer dials in `lib/fog.js`
+(`FOG_WISP_OCTAVES`, `FOG_DETAIL_OCTAVES`, `FOG_ENABLE_DETAIL`), never a
+player-facing knob).
+
+Three scales are composited: `mass` (plain fbm, large and slow — the general
+haze), `wisps` (ridged, medium scale — the visible threads), `detail` (ridged,
+fine and faint, `* 0.35` then `* 0.25` again in the mix — deliberately
+double-attenuated so it frays edges rather than adding its own visible shape).
+Before sampling the ridged layers, the UV is stretched `vec2(vUv.x, vUv.y *
+3.2)` — compressing V makes the noise argument change fast along "into the
+board" and slow along "across the board", so the ridges read as horizontal
+streaks, not an isotropic speckle. All three scales drift on **three
+non-parallel, non-proportional vectors** (not one vector negated/scaled) so
+the structure keeps reconfiguring rather than translating as a rigid pattern.
+
+**Alpha alone cannot carry the wisp structure over every tile.** FOG_COLOR
+(`#EDEBE3`) is a pale near-white close enough to the light squares' own tone
+that blending it at *any* opacity moves a light tile only a few luma units —
+confirmed by direct pixel diffs (fog on vs forced `visible=1.0` baseline):
+dark tiles shifted +18 to +39 luma, light tiles barely -5. The fix is varying
+the **colour**, not just the alpha: `fogColor = mix(uColor * 0.74, uColor,
+shaped)` — denser/greyer between wisps, palest at their peaks — which reads
+over light and dark tiles alike. If a future session sees "fog looks broken,
+board reads perfectly crisp" on a heavily-fogged test position (e.g.
+`?fen=4k3/8/8/8/8/8/8/4K3 w - - 0 1`), check this exact thing before assuming
+the shader math is wrong — it very likely isn't; sample real pixels against a
+`visible=1.0` baseline before concluding alpha is zero.
+
+Performance ladder, in order, if frame rate drops below 50: `FOG_DETAIL_OCTAVES`
+5 -> 3, then `FOG_ENABLE_DETAIL` -> false (drops the third scale entirely, and
+its GLSL function is not even included in the shader source when false), then
+`FOG_DRIFT_OPACITY` -> 0 (the second sheet's `<mesh>` is skipped from the JSX
+entirely when this is 0 — not rendered at zero alpha — so it saves the second
+draw call and shader compile, not just fill rate). **Real-GPU frame rate is
+unmeasured from this environment** — see "Headless browser" below; the
+software rasterizer here renders at roughly 1 fps regardless of scene
+complexity, so it cannot distinguish 30 fps from 60. Complexity is comparable
+to what shipped before this pass (three multi-octave noise evaluations per
+pixel per sheet, same as the old fbm-plus-domain-warp version), so it should
+not be a *new* regression, but verify on real hardware before trusting that.
 
 **The fog sits at y=0.05, just above the tiles — not above the pieces.**
 Floating it over the pieces (the obvious reading of "above the pieces") means
@@ -341,7 +390,7 @@ with only the listed squares cleared and paints them orange — the clear hole
 must land on the orange square. Corners alone do not prove it (they are
 invariant under mirroring); use a single asymmetric square.
 
-## Camera
+## Camera and environment
 
 The player is always White and rank 1 sits at z = -3.5, so the camera starts
 at **negative Z, behind White's own pieces**, looking up-board into the fog.
@@ -351,6 +400,123 @@ edge — wrong, and easy to do by accident.
 `components/CameraRig.jsx` pulls the camera back on narrow/portrait viewports.
 A single fixed position framed for a landscape window crops the board badly on
 a phone — production showed exactly that on a 390x844 screen.
+
+### Distance and polar clamps (GameCanvas.jsx)
+
+`MIN_DISTANCE = 8`, `MAX_DISTANCE = 14` (landscape/aspect>=1.3 values).
+Derived from the same ray-to-ground-plane method used for Plateau's `RADIUS`
+and Backdrop's skyline, not picked by feel — but the derivation had to bend
+around one constraint: the brief's literal target ("board occupies ~65% of
+frame at minDistance") solves to d~15 using the board's own AABB height /
+frame height, and that is *farther* than CameraRig's resting distance (11.55).
+A minDistance greater than the resting distance would make OrbitControls shove
+the default view backward on load. 8 instead clears the tallest piece (king,
+1.45) without cropping it at the frame edge, verified by screenshot at
+2200x920 and 390x844. 14 keeps the 21:9 bottom-corner ground-hit ray inside
+Plateau's radius (10.5) — the old value (17) put that ray at radius 12.6,
+already past the plateau's edge.
+
+**These are NOT declared as `<OrbitControls minDistance={} maxDistance={}>`
+props.** `CameraRig` owns them exclusively: on every resize it scales both by
+the same `pullbackFor(aspect)` factor applied to the resting position, and
+writes them directly onto the controls object. A portrait phone (pullback
+~1.6x) needs both the resting distance *and* the zoom bounds pulled back
+together, or minDistance stays put while the resting view moves — which let a
+portrait screen zoom in relatively tighter than landscape, cropping pieces at
+the frame edge. Declaring the unscaled values as JSX props *in addition to*
+CameraRig's imperative override is exactly the bug to avoid: drei re-applies
+declared props on some later re-render and would stomp the scaled values back
+to the landscape numbers.
+
+`MIN_POLAR_ANGLE = 0.838` rad (48 degrees) is **not** the "don't let the
+camera climb too vertical" aesthetic call it looks like — it is a hard
+geometric requirement, found empirically, not derived up front. Plateau's disc
+(radius 10.5) and the painted backdrop cylinder (radius 46) never touch —
+there's a bare annulus of ground between them nothing was ever drawn to cover.
+With the old flat CSS sky this was invisible (a gap showing uniform pale "sky"
+just reads as more sky). SkyDome's gradient is directional, so the exact same
+always-existing gap now shows up as a distinctly domed, wrong-toned bulge the
+instant the camera pitches shallow enough to see across it — confirmed visible
+through 40 degrees, gone by 45, at both MIN_DISTANCE and MAX_DISTANCE. 48 keeps
+a few degrees of margin. **If a future change moves the plateau or backdrop
+radius, re-check this angle** — closing the ground gap directly (extending
+Plateau's radius, or the backdrop cylinder's bottom edge, to actually meet)
+would be the more robust fix and would let this angle come back down, but
+wasn't attempted this pass.
+
+`MAX_POLAR_ANGLE = 1.25` rad (72 degrees), tightened from the old 1.4 (80) so
+the camera can't dip low enough to see up through the board's underside at the
+plateau's backface.
+
+Azimuth is **unclamped** — full 360 degrees. It used to be limited to the
+sector the painted backdrop segment covers; SkyDome (below) now closes the
+rest of the sphere, and the segment itself fades into the dome at its own
+edges, so there is no longer an edge to hide from.
+
+Verified: OrbitControls' own `update()` clamps the spherical position on
+every call, including mid-damping-inertia — a fast drag/wheel-flick sampled
+every `requestAnimationFrame` during and after release never showed
+polarAngle or distance outside bounds, even transiently. No overshoot guard
+was needed beyond what OrbitControls already does.
+
+### QA hook: exact camera placement from a script
+
+`GameCanvas.jsx`'s `DebugHooks` component (gated behind `?debug=1`, same
+convention as HUD's vision counter) exposes `window.__scene`, `window.__camera`,
+`window.__gl`, `window.__controls`. This is what makes camera-limit testing
+possible at all without approximating a position via imprecise mouse drags:
+
+```js
+// in a Playwright page.evaluate:
+window.__camera.position.set(x, y, z);   // any point relative to target (0,0,0)
+window.__controls.update();               // reads it into spherical, CLAMPS it, repositions
+// window.__controls.getDistance() / .getPolarAngle() / .getAzimuthalAngle() to verify
+```
+
+Setting `camera.position` directly and calling `controls.update()` is exactly
+what `CameraRig` already does every resize — proven safe. `update()` clamps
+against whatever `minDistance`/`maxDistance`/`minPolarAngle`/`maxPolarAngle`
+are *currently* set to, so requesting a value beyond a limit is itself a valid
+test (confirms the clamp, rather than just confirming the requested value).
+
+### SkyDome — closes the environment on every axis
+
+A painted backdrop or procedural ridge shells only cover a slice of the world
+around the camera's resting direction. `components/SkyDome.jsx` is what's
+*behind* them: a full sphere (radius 180, `BackSide`), so there is no longer a
+way to orbit into open space regardless of the camera's azimuth or pitch.
+
+Vertical gradient (`DOME_TOP_COLOR` #F0EBDE, `DOME_HORIZON_COLOR` #DCD6C8,
+`DOME_LOW_COLOR` #CFC7B6) is keyed off the sphere-local position's own Y
+(equivalent to elevation angle, correct regardless of dome radius since the
+sphere is centred on the origin and unscaled). A very faint fbm haze rides on
+top (`HAZE_AMOUNT = 0.035`), sampled directly off `vDir.xz` rather than an
+azimuth angle — `vDir.xz` is already a smooth, continuous parametrisation of
+direction with no wraparound, so there is no seam to special-case at any
+azimuth.
+
+**Deliberately not tonemapped and not fogged.** The dome doesn't include the
+`tonemapping_fragment`/fog chunks a raw `ShaderMaterial` needs explicitly (built
+-in materials get them automatically); leaving both out means the dome's own
+gradient is what's on screen, at the radius it's drawn, rather than being
+crushed to a single flat tint past `fog.far` or recompressed by ACES a second
+time. Scene fog color (`BACKDROP_FOG.color` in Backdrop.jsx) is set to
+`DOME_HORIZON_COLOR` exactly — the elevation band where the painting's own
+distance-fog fades out sits close to the dome's horizon stop, so matching them
+removes what would otherwise be a visible tone seam right at that dissolve.
+
+### Backdrop edge fade — the painting dissolves into the dome, not a hard clamp
+
+`getBackdropEdgeAlphaMap()` in `proceduralTextures.js` bakes a static analytic
+gradient (both azimuth edges fade over the first/last 12% of U, the mesh
+bottom fades over the first 18% of V) and applies it as an `alphaMap` on the
+existing `MeshBasicMaterial` (with `transparent: true` added). Baked rather
+than computed live in a custom shader on purpose: the gradient is a pure
+function of UV with nothing animated, so a texture produces an identical
+result to a live `smoothstep` while keeping `MeshBasicMaterial`'s built-in
+scene-fog blending, which the painting already relies on for its own distance
+fade. Matches `CylinderGeometry`'s UV convention (`v=1` is the mesh **top**) —
+get this backwards and the sky fades out instead of the foreground.
 
 ## Mountains
 
@@ -541,6 +707,14 @@ custom properties shared with the 3D scene.
   `THREE.PerspectiveCamera` at `[3.5, 7, -8.5]`, fov 42, `lookAt(0,0,0)` in
   Node and `project()` the world coordinate. `CameraRig` leaves that position
   alone at aspect >= 1.3, so the projection is exact.
+- `?debug=1` also exposes `window.__scene`/`__camera`/`__gl`/`__controls` (see
+  "Camera and environment" -> "QA hook: exact camera placement from a script")
+  — set `camera.position` directly and call `controls.update()` to test an
+  exact spherical position, including ones that should get clamped.
+- `?fen=4k3/8/8/8/8/8/8/4K3 w - - 0 1` (kings only) fogs 58 of 64 squares —
+  the fastest way to get a large, clean area of deep fog to inspect the wisp
+  shader's actual structure rather than guessing from the ~24-square starting
+  position.
 
 ## Headless browser: the scene runs at ~1 fps
 
@@ -560,10 +734,16 @@ verify:
 - `drawImage` on the WebGL canvas reads back black (no `preserveDrawingBuffer`).
   To sample rendered pixels, screenshot with Playwright and decode the PNG in
   Node instead.
+- `page.screenshot()`'s default 30s timeout is sometimes not enough even for
+  an ordinary (non-splat) view under load from repeated navigations in the
+  same session — pass an explicit longer `timeout` rather than assuming a
+  timeout means the page hung.
 
 Real-GPU performance cannot be measured from here. The fog shader is the thing
-to watch if it ever needs profiling: three fbm evaluations of five octaves each
-per pixel, across two stacked sheets.
+to watch if it ever needs profiling: one fbm plus two ridged-noise evaluations
+(five octaves each) per pixel, across two stacked sheets — the same order of
+cost as the fbm-plus-domain-warp version it replaced, not a new regression on
+its face, but unverified on real hardware.
 
 ## Dev-server gotcha
 

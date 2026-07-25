@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
-import { Canvas } from '@react-three/fiber';
+import { Canvas, useThree } from '@react-three/fiber';
 import { ContactShadows, OrbitControls } from '@react-three/drei';
 import CameraRig from './CameraRig';
 import { useChessGame } from '../lib/useChessGame';
@@ -9,20 +9,17 @@ import Board from './Board';
 import Pieces from './Pieces';
 import Fog from './Fog';
 import Lighting from './Lighting';
-import Backdrop, {
-  AZIMUTH_SWING,
-  BACKDROP_FOG,
-  BACKDROP_MODE,
-  HOME_AZIMUTH,
-} from './Backdrop';
+import Backdrop, { BACKDROP_FOG } from './Backdrop';
 import Plateau, { SHOW_PLATEAU } from './Plateau';
 import { playMoveSound } from './audio';
 import HUD from './HUD';
 import TitleScreen from './TitleScreen';
 
-// Light at the top, weightier toward the bottom — gives the frame a direction
-// and stops the sky reading as a flat fill.
-const SKY_GRADIENT = 'linear-gradient(180deg, #F4F0E7 0%, #E7DFD0 52%, #CDC1AA 100%)';
+// Only ever seen for the one frame before the canvas paints (or if WebGL is
+// unavailable) — SkyDome now covers the camera at every angle once mounted.
+// Stops match SkyDome's own top/horizon/low so that one frame doesn't flash a
+// different tone.
+const SKY_GRADIENT = 'linear-gradient(180deg, #F0EBDE 0%, #DCD6C8 52%, #CFC7B6 100%)';
 /*
  * ACES is stated explicitly rather than left to @react-three/fiber's default.
  * It happens to be the same value (fiber v8 picks ACESFilmicToneMapping unless
@@ -41,12 +38,88 @@ const TONE_MAPPING = THREE.ACESFilmicToneMapping;
 const EXPOSURE = 0.85;
 const PLAYER_COLOR = 'w';
 
-// The painted backdrop is one frame, not a seamless panorama, so in image mode
-// the orbit is clamped to the sector it covers. Procedural mode keeps 360.
-const AZIMUTH_LIMITS =
-  BACKDROP_MODE === 'image'
-    ? { minAzimuthAngle: HOME_AZIMUTH - AZIMUTH_SWING, maxAzimuthAngle: HOME_AZIMUTH + AZIMUTH_SWING }
-    : {};
+/*
+ * Distance clamps, derived from the same ray-to-ground-plane method used
+ * throughout this project (Plateau's RADIUS, Backdrop's skyline), not picked
+ * by feel. Both are along the camera's fixed viewing direction (BASE_POSITION
+ * normalized), so "distance" and "ground-hit radius" scale together linearly.
+ *
+ * MIN_DISTANCE = 8. The brief's target was "the board occupies ~65% of the
+ * frame at minDistance" — taken literally (board's own AABB height / frame
+ * height) that lands near d=15, but the *resting* camera (CameraRig's
+ * BASE_POSITION, distance 11.55) already sits closer than that, at ~90%. A
+ * minDistance greater than the resting distance would make OrbitControls
+ * shove the default view backward on load, changing the framing every other
+ * part of this file was tuned against. 8 is instead picked to comfortably
+ * clear the tallest piece on the board (the king, 1.45 units) without
+ * cropping it at the frame edges when it sits in a back corner, verified by
+ * screenshot at both 2200x920 and 390x844 — see CLAUDE.md.
+ *
+ * MAX_DISTANCE = 14. The old value (17) was never derived: at 17 the
+ * bottom-frame corner ray on a 21:9 viewport hits the ground at radius 12.6,
+ * past the plateau's full radius (10.5, see Plateau.jsx) — the rim's alpha
+ * fade is long gone there, so widescreen players could already zoom the
+ * plateau's edge into the bottom corners. 14 keeps that same corner ray
+ * inside 10.5.
+ */
+const MIN_DISTANCE = 8;
+const MAX_DISTANCE = 14;
+
+/*
+ * Polar angle is measured from straight overhead (0) to straight underneath
+ * (PI) in three.js/OrbitControls terms.
+ *
+ * MIN_POLAR_ANGLE = 0.838 rad (48 degrees) is NOT the "don't let the camera
+ * climb too vertical" aesthetic preference it might look like — it is a hard
+ * geometric requirement. Plateau's disc (radius 10.5) and the painted
+ * backdrop cylinder (radius 46) never touch; there is a bare annulus of
+ * ground between them that nothing was ever drawn to cover, because with the
+ * old flat CSS sky nobody could tell — a gap showing uniform pale "sky" reads
+ * as more sky. SkyDome's gradient is directional, so the same always-existing
+ * gap now shows up as a distinctly domed, un-ground-colored bulge the instant
+ * the camera pitches shallow enough to see across it (confirmed empirically:
+ * visible through 40 degrees, gone by 45, at both MIN_DISTANCE and
+ * MAX_DISTANCE). 48 keeps a few degrees of margin past that.
+ *
+ * MAX_POLAR_ANGLE = 1.25 rad (72 degrees), tightened from the old 1.4 (80) so
+ * the camera can't dip low enough to look up through the board's underside at
+ * the plateau's raw backface.
+ *
+ * Both are distance-independent, so they stay fixed regardless of the
+ * MIN/MAX_DISTANCE tuning above.
+ */
+const MIN_POLAR_ANGLE = 0.838;
+const MAX_POLAR_ANGLE = 1.25;
+
+/*
+ * Azimuth is unclamped. It used to be limited to the ~60 degree sector the
+ * painted backdrop's segment actually covers (see Backdrop.jsx's old
+ * AZIMUTH_SWING) — SkyDome now closes the other 300 degrees, and the painted
+ * segment itself fades into the dome at its own edges (see
+ * getBackdropEdgeAlphaMap), so there is no longer an edge to hide from.
+ */
+
+/**
+ * QA hook, gated behind ?debug=1 like the HUD's own vision counter: exposes
+ * the live scene/camera/controls so an external script (Playwright, a console
+ * session) can set an exact spherical position and screenshot it, rather than
+ * approximating one with mouse drags. See CLAUDE.md's camera QA section.
+ */
+function DebugHooks({ controlsRef }) {
+  const scene = useThree((s) => s.scene);
+  const camera = useThree((s) => s.camera);
+  const gl = useThree((s) => s.gl);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.location.search.includes('debug')) return;
+    window.__scene = scene;
+    window.__camera = camera;
+    window.__gl = gl;
+    window.__controls = controlsRef.current;
+  });
+
+  return null;
+}
 
 // QA hook: ?fen=... lets a specific position (mate, stalemate) be loaded
 // directly. Read once at mount; the component is already client-only.
@@ -147,17 +220,22 @@ export default function GameCanvas() {
 
         <Fog visibility={visibility} />
 
-        <CameraRig controlsRef={controlsRef} />
+        {/* minDistance/maxDistance are NOT declared here — CameraRig owns them
+            exclusively, scaled per-aspect. See the comment on CameraRig for
+            why splitting that ownership is what breaks it. */}
+        <CameraRig controlsRef={controlsRef} minDistance={MIN_DISTANCE} maxDistance={MAX_DISTANCE} />
+        <DebugHooks controlsRef={controlsRef} />
         <OrbitControls
           ref={controlsRef}
           enablePan={false}
-          minPolarAngle={0.2}
-          maxPolarAngle={1.4}
-          minDistance={5}
-          // Capped so the board can never shrink to a speck inside the ranges.
-          maxDistance={17}
-          {...AZIMUTH_LIMITS}
           enableDamping
+          dampingFactor={0.08}
+          // 0.45, not drei's default 1: the old default let one wheel notch
+          // jump the camera hard enough to feel like a cut, not a zoom.
+          zoomSpeed={0.45}
+          rotateSpeed={0.5}
+          minPolarAngle={MIN_POLAR_ANGLE}
+          maxPolarAngle={MAX_POLAR_ANGLE}
         />
       </Canvas>
 
