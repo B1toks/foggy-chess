@@ -453,18 +453,63 @@ streaks, not an isotropic speckle. All three scales drift on **three
 non-parallel, non-proportional vectors** (not one vector negated/scaled) so
 the structure keeps reconfiguring rather than translating as a rigid pattern.
 
-**Alpha alone cannot carry the wisp structure over every tile.** FOG_COLOR
-(`#EDEBE3`) is a pale near-white close enough to the light squares' own tone
-that blending it at *any* opacity moves a light tile only a few luma units —
-confirmed by direct pixel diffs (fog on vs forced `visible=1.0` baseline):
-dark tiles shifted +18 to +39 luma, light tiles barely -5. The fix is varying
-the **colour**, not just the alpha: `fogColor = mix(uColor * 0.74, uColor,
-shaped)` — denser/greyer between wisps, palest at their peaks — which reads
-over light and dark tiles alike. If a future session sees "fog looks broken,
-board reads perfectly crisp" on a heavily-fogged test position (e.g.
-`?fen=4k3/8/8/8/8/8/8/4K3 w - - 0 1`), check this exact thing before assuming
-the shader math is wrong — it very likely isn't; sample real pixels against a
-`visible=1.0` baseline before concluding alpha is zero.
+**Alpha compositing alone cannot carry the wisp structure over every tile —
+this was tried twice and failed twice.** The first attempt used a flat
+`FOG_COLOR` with plain alpha; the second (Крок 8) varied the colour by cloud
+density (`fogColor = mix(uColor * 0.74, uColor, shaped)`, denser/greyer
+between wisps) to at least give dark tiles a strong signal. Both still failed
+on light tiles specifically: `FOG_COLOR` (`#EDEBE3`) is a pale near-white
+close enough to the light squares' own tone (`#E0D6C0`) that painting it
+*over* the tile at any alpha barely moves the result — confirmed by direct
+pixel diffs at the time: dark tiles shifted +18 to +39 luma, light tiles
+barely -5. Alpha compositing is fundamentally the wrong operation for this:
+it can only pull a pixel *toward* FOG_COLOR, and FOG_COLOR was already close
+to where light tiles start.
+
+**Крок 9.5's fix is two separate layers with two different blend modes, not
+one layer with a better colour.** `FogShader.jsx` now renders three meshes
+instead of two:
+
+- **`groundMultiply`** — `THREE.MultiplyBlending`, `FOG_TINT_COLOR`
+  (`#B8BDC2`, cool grey-blue). Multiply *scales* whatever is already in the
+  framebuffer instead of painting over it: `base = mix(vec3(1.0), uTint,
+  density * uOpacity)`, so a fully visible square (`density == 0`) multiplies
+  by literal white — a no-op, the tile's own colour passes through completely
+  unchanged — and a fogged square multiplies toward the tint regardless of
+  whether the tile started light or dark. This is the layer that actually
+  fixes the readability bug; it does not care what colour the destination
+  pixel was, which alpha compositing structurally cannot say.
+- **`groundStrands`** — ordinary alpha blending, `FOG_STRAND_COLOR`
+  (`#F4F1EA`, pale), `alpha = shaped * density * 0.5 * uOpacity`. The visible
+  wisp threads, laid on top of the base the multiply layer already darkened.
+  This is close to what the old single-layer shader painted, but it no longer
+  has to also carry "is this square fogged at all" — that job now belongs
+  entirely to the multiply layer — so it can stay a pale, high-contrast
+  overlay without disappearing into a light tile itself.
+- **`driftStrands`** — the existing second, higher parallax sheet, unchanged
+  in role: still strands-only (no multiply pass of its own), since its job is
+  faint drifting detail on a base the ground layer already darkened, not
+  readability on its own.
+
+`sharedUniformsAndNoiseGLSL()` and `densityAndShapeGLSL()` in `FogShader.jsx`
+hold the code both the multiply and the strands fragment shader need (mask
+sampling, the three noise scales, `density`, `shaped`) as one piece of
+template text, not two independently-maintained copies — the two shaders
+differ only in their last few lines.
+
+Verified with real pixel measurements, not the `visible=1.0` trick this
+section used to recommend (that baseline compares "fog on" to "fog config
+forced off," which conflates the readability question with the shader
+existing at all): sampled a fogged, empty light square (a8) against a clean,
+*visible*, empty light square (b3, a rank-3 pawn-attack square) on the same
+rendered frame. **Light tile: -54 luma. Dark tile (e7 vs a3): -28 luma.**
+Both obviously darker, not "a few units." If a future session sees "fog looks
+broken, board reads perfectly crisp," sample two real, currently-rendered
+squares this way — one fogged, one visible, same tile colour — rather than
+toggling fog off entirely; the multiply layer only exists on fogged pixels
+(`if (density < 0.002) discard;`), so a broken multiply pass and a working one
+look identical on a `visible=1.0` baseline that never had any fog to begin
+with.
 
 Performance ladder, in order, if frame rate drops below 50: `FOG_DETAIL_OCTAVES`
 5 -> 3, then `FOG_ENABLE_DETAIL` -> false (drops the third scale entirely, and
