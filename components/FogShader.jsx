@@ -175,11 +175,19 @@ function densityAndShapeGLSL() {
     // A wisp along the frontier. The mask gradient peaks exactly where
     // visible meets fogged, so it thickens the boundary and keeps it from
     // reading as a plain translucent rectangle.
+    //
+    // Крок 10, Section D: the boundary should "boil" rather than trace a flat
+    // line. Warping where the gradient samples land by detail (the finest,
+    // fastest-drifting of the three noise scales already computed above)
+    // gets that for free — no fourth noise evaluation, and the wobble
+    // inherits detail's own time-drift automatically instead of needing a
+    // separate clock term.
     vec2 texel = vec2(1.0 / 8.0);
-    float gx = texture2D(uMask, vUv + vec2(texel.x, 0.0)).r
-             - texture2D(uMask, vUv - vec2(texel.x, 0.0)).r;
-    float gy = texture2D(uMask, vUv + vec2(0.0, texel.y)).r
-             - texture2D(uMask, vUv - vec2(0.0, texel.y)).r;
+    vec2 boil = vec2(detail, wisps - mass) * 0.035;
+    float gx = texture2D(uMask, vUv + vec2(texel.x, 0.0) + boil).r
+             - texture2D(uMask, vUv - vec2(texel.x, 0.0) + boil).r;
+    float gy = texture2D(uMask, vUv + vec2(0.0, texel.y) + boil).r
+             - texture2D(uMask, vUv - vec2(0.0, texel.y) + boil).r;
     // Gated by (1 - ownVisible): the gradient is nonzero on *both* sides of
     // a boundary (a visible texel next to a fogged one has just as steep a
     // gradient as the fogged texel itself), but the frontier-thickening

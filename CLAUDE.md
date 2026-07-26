@@ -645,6 +645,24 @@ itself reuses `PieceModel`'s existing `fade` prop (clones BONE/LACQUER
 per-instance so opacity can animate without touching every piece of that
 colour) — the same mechanism `CaptureGhost` already used for fade-*out*.
 
+**Крок 10, Section D (partial): the frontier boils, piece-proximity swirl was
+not attempted.** The boundary gradient sample (`gx`/`gy` in
+`densityAndShapeGLSL`) is now offset by a small warp built from `detail`
+(the finest, fastest-drifting of the three noise scales already computed for
+`clouds`) instead of sampling at a fixed `vUv` — free wobble with no fourth
+noise evaluation, and it inherits `detail`'s own time-drift rather than
+needing a separate clock term. Verified this doesn't reopen either of Section
+B's bugs: deep-fog adjacent pairs still delta 1, visible squares still read
+clean at both the default view and `MIN_POLAR_ANGLE` (both gated by
+`ownVisible`/`(1 - ownVisible)` exactly as before — the boil only perturbs
+*where* the gradient samples, never whether a visible square gets any edge
+term at all). The brief's second half of this section — pieces near the
+frontier locally dispersing the fog around them via a per-move "closeness to
+pieces" texture — was skipped: it needs piece world positions plumbed into
+the shader (a new input, not just a reused noise term) and this is explicitly
+the brief's lowest-priority ask ("якщо лишиться час"). Worth doing later, not
+worth rushing after A/B/C/E were already the higher-priority asks.
+
 Mask orientation is easy to get subtly wrong (mirrored/transposed) and hard to
 spot on a symmetric start position. `/dev-fog?visible=a1` renders top-down
 with only the listed squares cleared and paints them orange — the clear hole
