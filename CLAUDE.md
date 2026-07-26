@@ -454,84 +454,125 @@ non-parallel, non-proportional vectors** (not one vector negated/scaled) so
 the structure keeps reconfiguring rather than translating as a rigid pattern.
 
 **Alpha compositing alone cannot carry the wisp structure over every tile —
-this was tried twice and failed twice.** The first attempt used a flat
-`FOG_COLOR` with plain alpha; the second (Крок 8) varied the colour by cloud
-density (`fogColor = mix(uColor * 0.74, uColor, shaped)`, denser/greyer
-between wisps) to at least give dark tiles a strong signal. Both still failed
-on light tiles specifically: `FOG_COLOR` (`#EDEBE3`) is a pale near-white
-close enough to the light squares' own tone (`#E0D6C0`) that painting it
-*over* the tile at any alpha barely moves the result — confirmed by direct
-pixel diffs at the time: dark tiles shifted +18 to +39 luma, light tiles
-barely -5. Alpha compositing is fundamentally the wrong operation for this:
-it can only pull a pixel *toward* FOG_COLOR, and FOG_COLOR was already close
-to where light tiles start.
+tried, in order, three separate times.** Flat `FOG_COLOR` with plain alpha;
+then (Крок 8) colour varied by cloud density; then (Крок 9.5) `groundMultiply`
++ `groundStrands`, `THREE.MultiplyBlending` as the primary readability
+mechanism instead of alpha. Крок 9.5 fixed light-tile readability (measured
+-54/-28 luma at the time) but not *occlusion*: multiply can only ever scale
+what's underneath, never truly hide it, so a careful look could still tell a
+light tile from a dark one even under "readable" fog — tinted glass, not fog
+of war. See git history on this file for the full account of the first two
+attempts; both are superseded, not just tuned further.
 
-**Крок 9.5's fix is two separate layers with two different blend modes, not
-one layer with a better colour.** `FogShader.jsx` now renders three meshes
-instead of two:
+**Крок 10, Section A rebuilt the curve around real opacity.** Alpha is the
+primary mechanism again, but this time reaching `FOG_MAX_ALPHA` (0.94) in the
+deep field: `alpha = smoothstep(0.0, FOG_ALPHA_KNEE, density) * FOG_MAX_ALPHA
+* uOpacity`. At 0.94, whatever's underneath contributes at most 6% of the
+final pixel — that 6% ceiling is where the verification bar ("< 6 luma
+difference between adjacent deep-fogged tiles") actually comes from, not a
+number picked to sound precise. `FOG_ALPHA_KNEE` (0.38) is low on purpose:
+most of the fogged field sits at full opacity, not just its deepest interior
+— half-fogged is deliberately not a state this game spends much visual area
+in. `FOG_TINT_COLOR` survives, demoted to a single subtle multiply pass
+(`density` 0.15-0.5 only) that adds a little extra depth right at the
+frontier on top of what the alpha layer already carries — no longer the
+mechanism, just an accent.
 
-- **`groundMultiply`** — `THREE.MultiplyBlending`, `FOG_TINT_COLOR`
-  (`#B8BDC2`, cool grey-blue). Multiply *scales* whatever is already in the
-  framebuffer instead of painting over it: `base = mix(vec3(1.0), uTint,
-  density * uOpacity)`, so a fully visible square (`density == 0`) multiplies
-  by literal white — a no-op, the tile's own colour passes through completely
-  unchanged — and a fogged square multiplies toward the tint regardless of
-  whether the tile started light or dark. This is the layer that actually
-  fixes the readability bug; it does not care what colour the destination
-  pixel was, which alpha compositing structurally cannot say.
-- **`groundStrands`** — ordinary alpha blending, `FOG_STRAND_COLOR`
-  (`#F4F1EA`, pale), `alpha = shaped * density * 0.5 * uOpacity`. The visible
-  wisp threads, laid on top of the base the multiply layer already darkened.
-  This is close to what the old single-layer shader painted, but it no longer
-  has to also carry "is this square fogged at all" — that job now belongs
-  entirely to the multiply layer — so it can stay a pale, high-contrast
-  overlay without disappearing into a light tile itself.
-- **`driftStrands`** — the existing second, higher parallax sheet, unchanged
-  in role: still strands-only (no multiply pass of its own), since its job is
-  faint drifting detail on a base the ground layer already darkened, not
-  readability on its own.
+**Two real bugs surfaced during verification, both worth knowing about before
+touching this curve again:**
 
-`sharedUniformsAndNoiseGLSL()` and `densityAndShapeGLSL()` in `FogShader.jsx`
-hold the code both the multiply and the strands fragment shader need (mask
-sampling, the three noise scales, `density`, `shaped`) as one piece of
-template text, not two independently-maintained copies — the two shaders
-differ only in their last few lines.
+1. *Noise-driven colour variance can itself blow the readability budget.*
+   `FOG_DEPTH_COLOR_LOW`/`HIGH` (`#B4B9BA`/`#DCDEDB`) span ~37 luma, and
+   mixing across that full range at every density meant two *adjacent*
+   deep-fog pixels could differ by more than "< 6 luma" purely from noise
+   phase — independent of which tile was underneath, and bigger than the
+   underlying-tile leak the alpha fix was built to solve. The brief's own
+   colour range is for the frontier ("на межі — м'який градієнт, це те, що
+   розповідає історію"); the deep interior is supposed to be "глухо" —
+   muffled, uniform — so `colorVariance` in `FogShader.jsx` fades the
+   LOW/HIGH mix out as `density` rises past the knee, converging on a flat
+   `FOG_DEPTH_COLOR_MID` (`#C4C8C7`, the brief's own reference tone) deep in
+   the field. Verified after the fix: four separate adjacent light/dark pairs
+   scattered across the fogged half, luma delta of **1** on every one.
+2. *`LinearFilter` on the mask bleeds fog onto technically-visible squares.*
+   Sampling the mask at the live, freely-varying `vUv` blends in whichever
+   neighbouring texel is closer whenever a fragment lands anywhere near a
+   texel boundary — which is most of a boundary square's own area, not just
+   its edge pixels. At the old, gentler alpha ceiling this was invisible; at
+   0.94 it alone washed a fully *visible* rank-3 square down by 70+ luma,
+   failing "visible squares stay absolutely clean" outright, and could even
+   flip a light tile's measured luma below an adjacent dark one. Fixed by
+   snapping to the containing texel's exact centre before the "am I on a
+   visible square" sample — bilinear weights are exactly `(1,0,0,0)` at a
+   texel centre, so that read (`ownVisible` in the shader) is the true
+   discrete state of *this* square, never a neighbour's blend. The frontier
+   gradient term (`edge`) gets the same treatment via a `(1.0 - ownVisible)`
+   gate — it's genuinely nonzero on *both* sides of a boundary, but the
+   thickening effect belongs only on the fogged side.
 
-Verified with real pixel measurements, not the `visible=1.0` trick this
-section used to recommend (that baseline compares "fog on" to "fog config
-forced off," which conflates the readability question with the shader
-existing at all): sampled a fogged, empty light square (a8) against a clean,
-*visible*, empty light square (b3, a rank-3 pawn-attack square) on the same
-rendered frame. **Light tile: -54 luma. Dark tile (e7 vs a3): -28 luma.**
-Both obviously darker, not "a few units." If a future session sees "fog looks
-broken, board reads perfectly crisp," sample two real, currently-rendered
-squares this way — one fogged, one visible, same tile colour — rather than
-toggling fog off entirely; the multiply layer only exists on fogged pixels
-(`if (density < 0.002) discard;`), so a broken multiply pass and a working one
-look identical on a `visible=1.0` baseline that never had any fog to begin
-with.
+**Крок 10, Section B gave fog height.** `FogShader.jsx` renders `FOG_LAYERS`
+(5) planes instead of one, at `FOG_LAYER_HEIGHTS` (0.02/0.07/0.14/0.23/0.34)
+with `FOG_LAYER_ALPHA_MULT` (1.0/0.55/0.35/0.2/0.1) — the base layer alone
+reproduces Section A's curve exactly and carries all of the readability
+guarantee; every layer above it is silhouette, never a second source of
+occlusion. Per-layer variation (`layerParams()` in `FogShader.jsx`, derived
+from index, not hand-picked, so `FOG_LAYERS` can drop 5→2 without leaving
+orphaned config):
 
-Performance ladder, in order, if frame rate drops below 50: `FOG_DETAIL_OCTAVES`
-5 -> 3, then `FOG_ENABLE_DETAIL` -> false (drops the third scale entirely, and
-its GLSL function is not even included in the shader source when false), then
-`FOG_DRIFT_OPACITY` -> 0 (the second sheet's `<mesh>` is skipped from the JSX
-entirely when this is 0 — not rendered at zero alpha — so it saves the second
-draw call and shader compile, not just fill rate). **Real-GPU frame rate is
-unmeasured from this environment** — see "Headless browser" below; the
-software rasterizer here renders at roughly 1 fps regardless of scene
-complexity, so it cannot distinguish 30 fps from 60. Complexity is comparable
-to what shipped before this pass (three multi-octave noise evaluations per
-pixel per sheet, same as the old fbm-plus-domain-warp version), so it should
-not be a *new* regression, but verify on real hardware before trusting that.
+- **Noise scale grows with height** (`1.0 + index * 0.35`) — higher layers
+  read finer-grained.
+- **Drift direction and speed differ per layer** — `uDriftAngle` rotates the
+  three drift vectors (never the static anisotropic sampling grid itself,
+  which would fight the "horizontal streak, not isotropic speckle" design);
+  `uDriftScale` alternates sign and grows slightly with index.
+- **`uUvOffset`, proportional to height**, shifts each layer's whole noise
+  field so five layers never sample the *identical* pattern stacked directly
+  on top of each other (which would silhouette as one layer, not five). Real
+  geometric parallax between layers — the point where "shift with the
+  camera" actually happens — falls out for free from them being genuine
+  planes at different Y as the camera orbits; this offset is a *static*
+  complement to that, not a substitute for it.
+- **`uSurfaceStart`/`uSurfaceEnd`** gate each raised layer's alpha by an
+  extra `smoothstep` on `density`, stepping up with index (`index * 0.1` to
+  `index * 0.1 + 0.22`) — "top surface": a raised layer only appears where
+  the fog beneath it is *already* substantially deep, tapering the whole
+  stack's silhouette to nothing at the frontier instead of a hard-edged wall
+  of planes. The base layer's gate is `[0, 0]` (unrestricted).
 
-**The fog sits at y=0.05, just above the tiles — not above the pieces.**
-Floating it over the pieces (the obvious reading of "above the pieces") means
-a shallow camera looks through every fogged square between it and a distant
-piece, washing the whole board out. Nothing ever pokes through at ground
-level: a square holding one of your own pieces is always visible so never
-fogged, and enemy pieces inside fog are not rendered at all. Move-highlights
-sit at `HIGHLIGHT_HEIGHT` just above the fog so legal-move markers stay crisp
-on squares you have not explored.
+**Milkiness at shallow camera angles was the standing risk from Крок 8/9's
+own drift-sheet history** — anything raised above the board can occlude far
+squares when several stacked semi-transparent planes compound in screen
+space, which is exactly what "visible squares stay absolutely clean" would
+catch first. Verified at `MIN_POLAR_ANGLE` (22 degrees, the steepest/most
+overhead angle in range and the one Крок 8 fought hardest to unlock) with the
+same adjacent-pair pixel method: visible squares read within a few luma of
+their unfogged base colours (light > dark, correctly ordered), deep-fog pairs
+still delta 1. The `ownVisible`/`edge`-gating fix above is *why* this holds
+regardless of how many layers are stacked overhead — each layer
+independently zeroes out over a genuinely visible square, so stacking more
+of them adds silhouette over fog, never haze over clarity.
+
+Performance ladder, in order, if frame rate drops below 50: `FOG_LAYERS` 5 ->
+4 -> 3 -> 2 (drops both draw calls and the noise evaluations behind them —
+the biggest lever, cut first), then `FOG_DETAIL_OCTAVES` 5 -> 3, then
+`FOG_ENABLE_DETAIL` -> false (drops the third noise scale entirely, and its
+GLSL function is not even included in the shader source when false). **Real-
+GPU frame rate is unmeasured from this environment** — see "Headless browser"
+below; the software rasterizer here renders at roughly 1 fps regardless of
+scene complexity, so it cannot distinguish 30 fps from 60. Five layers at
+five-octave ridged noise each is meaningfully more per-pixel cost than the
+two-sheet Крок 9.5 version — verify on real hardware before trusting the
+default `FOG_LAYERS = 5`.
+
+**The fog's base layer sits at y=0.02, just above the tiles — not above the
+pieces.** Floating it over the pieces (the obvious reading of "above the
+pieces") means a shallow camera looks through every fogged square between it
+and a distant piece, washing the whole board out. Nothing ever pokes through
+at ground level: a square holding one of your own pieces is always visible so
+never fogged, and enemy pieces inside fog are not rendered at all.
+Move-highlights sit at `HIGHLIGHT_HEIGHT` — now above the *tallest* fog layer
+(0.34 + 0.02) rather than a fixed 0.07 — so legal-move markers stay crisp on
+squares you have not explored, even through the raised silhouette layers.
 
 Mask orientation is easy to get subtly wrong (mirrored/transposed) and hard to
 spot on a symmetric start position. `/dev-fog?visible=a1` renders top-down

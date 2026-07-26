@@ -3,14 +3,17 @@ import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import {
   ALL_SQUARES,
+  FOG_ALPHA_KNEE,
+  FOG_DEPTH_COLOR_HIGH,
+  FOG_DEPTH_COLOR_LOW,
+  FOG_DEPTH_COLOR_MID,
   FOG_DETAIL_OCTAVES,
-  FOG_DRIFT_HEIGHT,
-  FOG_DRIFT_OPACITY,
   FOG_ENABLE_DETAIL,
-  FOG_HEIGHT,
+  FOG_LAYER_ALPHA_MULT,
+  FOG_LAYER_HEIGHTS,
+  FOG_LAYERS,
   FOG_LERP_SPEED,
-  FOG_OPACITY,
-  FOG_STRAND_COLOR,
+  FOG_MAX_ALPHA,
   FOG_TINT_COLOR,
   FOG_WISP_OCTAVES,
   squareToMaskIndex,
@@ -34,12 +37,9 @@ const VERTEX_SHADER = /* glsl */ `
  * reads as fibrous wisps and gaps rather than clouds.
  *
  * Octave count is baked into the function name/loop bound at shader-source
- * build time (see the fragment-shader builders below), not passed as a
- * uniform: GLSL loop bounds are simplest and most portable as compile-time
- * constants, and this is a perf knob a developer dials (lib/fog.js), never
- * something a player or a URL touches — a plain top-of-file constant is the
- * right shape for it, matching how PIECE_SCALE etc. are tuned elsewhere in
- * this project.
+ * build time, not passed as a uniform: GLSL loop bounds are simplest and
+ * most portable as compile-time constants, and this is a perf knob a
+ * developer dials (lib/fog.js), never something a player or a URL touches.
  */
 function ridgedGLSL(name, octaves) {
   return /* glsl */ `
@@ -60,9 +60,9 @@ function ridgedGLSL(name, octaves) {
 }
 
 /*
- * Shared by both the multiply and the strands fragment shader below: the
- * uniforms and noise functions neither varies by mode, so it only exists as
- * one piece of text instead of two copies that could quietly drift apart.
+ * Shared by every layer's fragment shader (and the edge-multiply pass): the
+ * uniforms and noise functions don't vary, so this exists as one piece of
+ * text instead of several copies that could quietly drift apart.
  */
 function sharedUniformsAndNoiseGLSL() {
   return /* glsl */ `
@@ -71,49 +71,81 @@ function sharedUniformsAndNoiseGLSL() {
     uniform float uOpacity;
     uniform float uScale;
     uniform float uDriftScale;
+    uniform float uDriftAngle;
+    uniform vec2 uUvOffset;
     uniform float uEdgeGain;
     varying vec2 vUv;
 
     ${FBM_GLSL}
     ${ridgedGLSL('ridgedWisp', FOG_WISP_OCTAVES)}
     ${FOG_ENABLE_DETAIL ? ridgedGLSL('ridgedDetail', FOG_DETAIL_OCTAVES) : ''}
+
+    vec2 rotate(vec2 v, float a) {
+      float c = cos(a);
+      float s = sin(a);
+      return vec2(c * v.x - s * v.y, s * v.x + c * v.y);
+    }
   `;
 }
 
 /*
  * Also shared: everything from sampling the mask through to `density` (how
  * fogged this pixel is, boundary-boosted) and `shaped` (the wisp pattern's
- * own coverage, 0..1). Both fragment shaders below need exactly these two
- * numbers and differ only in what they do with them.
+ * own coverage, 0..1).
+ *
+ * Крок 10, Section B additions over the Крок 9.5 version: `uUvOffset` shifts
+ * this layer's whole noise field by an amount the caller sets proportional
+ * to the layer's own height ("UV-зсув пропорційний висоті" in the brief) —
+ * real geometric parallax between layers already falls out for free from
+ * them being actual planes at different Y as the camera orbits; this offset
+ * is what keeps five layers from ever sampling the *identical* pattern
+ * directly on top of each other, which would silhouette as one layer, not
+ * five. `uDriftAngle` rotates the three drift vectors (not the static
+ * sampling grid — that would fight the deliberately anisotropic "stretched"
+ * sampling below and turn horizontal streaks into a rotated mess) so each
+ * layer's wisps drift in their own direction, not just at their own speed.
  */
 function densityAndShapeGLSL() {
   return /* glsl */ `
-    // LinearFilter on the 8x8 mask is what turns per-square 0/1 values into
-    // a smooth gradient, so this is already soft before the noise lands.
-    float visible = texture2D(uMask, vUv).r;
+    vec2 sampleUv = vUv + uUvOffset;
+
+    // Крок 10, Section B fix: sampling the mask at the live, freely-varying
+    // vUv through a LinearFilter texture blends in neighbouring texels
+    // whenever a fragment lands anywhere near a texel boundary — which is
+    // most of a boundary square's own area, not just its edge pixels. At
+    // the old, gentler alpha ceiling that bleed was invisible; at
+    // FOG_MAX_ALPHA=0.94 it was enough on its own to wash a fully *visible*
+    // boundary square down by 80+ luma, failing "visible squares stay
+    // absolutely clean" outright. Snapping to the containing texel's exact
+    // centre before sampling reads that texel undiluted — bilinear weights
+    // are exactly (1,0,0,0) at a texel centre — so ownVisible is the true
+    // discrete 0/1 state of *this* square, never a neighbour's blend.
+    vec2 cellUv = (floor(vUv * 8.0) + 0.5) / 8.0;
+    float ownVisible = texture2D(uMask, cellUv).r;
 
     // Three non-parallel, non-proportional drift vectors — not one vector
     // scaled and negated — so the wisp structure keeps reconfiguring as it
-    // moves instead of just translating as a rigid pattern.
-    vec2 driftMass   = vec2( 0.015, -0.009) * uTime * uDriftScale;
-    vec2 driftWisps  = vec2(-0.021,  0.017) * uTime * uDriftScale;
-    vec2 driftDetail = vec2( 0.034,  0.026) * uTime * uDriftScale;
+    // moves instead of just translating as a rigid pattern. Rotated per
+    // layer by uDriftAngle so each layer also drifts its own direction.
+    vec2 driftMass   = rotate(vec2( 0.015, -0.009), uDriftAngle) * uTime * uDriftScale;
+    vec2 driftWisps  = rotate(vec2(-0.021,  0.017), uDriftAngle) * uTime * uDriftScale;
+    vec2 driftDetail = rotate(vec2( 0.034,  0.026), uDriftAngle) * uTime * uDriftScale;
 
     // Compressing the sample point's V by 3.2x before feeding it to the
     // ridged layers means the noise argument changes fast along V (rank,
     // "into the board") and slow along U (file, "across the board") — so
     // the ridges it produces read as long streaks along U: horizontal
     // wisps, not an isotropic speckle.
-    vec2 stretched = vec2(vUv.x, vUv.y * 3.2);
+    vec2 stretched = vec2(sampleUv.x, sampleUv.y * 3.2);
 
     // Large, slow: the general mass of haze — this is what the old single
     // fbm() call used to be on its own.
-    float mass = fbm(vUv * 3.0 * uScale + driftMass);
+    float mass = fbm(sampleUv * 3.0 * uScale + driftMass);
     // Medium, ridged: the wisps themselves.
     float wisps = ridgedWisp(stretched * 4.0 * uScale + driftWisps);
     // Small, ridged, faint: frays the edges of the wisps rather than adding
-    // its own visible shapes — note the double attenuation (0.35 here, 0.5
-    // again in the strand alpha), deliberately faint.
+    // its own visible shapes — note the double attenuation (0.35 here, more
+    // wherever shaped is used below), deliberately faint.
     float detail = ${FOG_ENABLE_DETAIL ? "ridgedDetail(stretched * 11.0 * uScale + driftDetail) * 0.35" : "0.0"};
 
     float clouds = mass * 0.5 + wisps * 0.4 + detail * 0.25;
@@ -126,30 +158,99 @@ function densityAndShapeGLSL() {
              - texture2D(uMask, vUv - vec2(texel.x, 0.0)).r;
     float gy = texture2D(uMask, vUv + vec2(0.0, texel.y)).r
              - texture2D(uMask, vUv - vec2(0.0, texel.y)).r;
-    float edge = clamp(length(vec2(gx, gy)) * 1.8, 0.0, 1.0);
+    // Gated by (1 - ownVisible): the gradient is nonzero on *both* sides of
+    // a boundary (a visible texel next to a fogged one has just as steep a
+    // gradient as the fogged texel itself), but the frontier-thickening
+    // effect is only wanted on the fogged side. Without this gate a visible
+    // boundary square picked up real density from its fogged neighbour's
+    // edge alone — the second half of the same bleed cellUv above fixes
+    // for the mask's base term.
+    float edge = clamp(length(vec2(gx, gy)) * 1.8, 0.0, 1.0) * (1.0 - ownVisible);
 
     float shaped = smoothstep(0.28, 0.78, clouds);
 
     // Steeper than linear so the fog stays opaque in the deep and gives way
     // quickly near the frontier, plus the edge boost so the boundary itself
-    // stays dense rather than reading as a flat translucent rectangle. Zero
-    // on a fully visible square away from any fogged neighbour — visible=1
-    // and edge=0 both drop out — which is what keeps clean squares clean in
-    // both layers below.
-    float density = pow(1.0 - visible, 1.35) + edge * uEdgeGain;
+    // stays dense rather than reading as a flat translucent rectangle. Exactly
+    // zero on a visible square: ownVisible=1 zeroes the first term, and the
+    // (1 - ownVisible) gate above zeroes edge too — both independently, so a
+    // visible square stays clean regardless of camera angle, how many layers
+    // are stacked overhead, or how steep its neighbour's own gradient is.
+    float density = pow(1.0 - ownVisible, 1.35) + edge * uEdgeGain;
   `;
 }
 
 /*
- * Крок 9.5, Component 1 — the darkening base. THREE.MultiplyBlending scales
- * whatever is already in the framebuffer instead of painting over it, which
- * is what makes this darken a light tile exactly as reliably as a dark one:
- * a fully visible square has density 0, so `base` is exactly vec3(1.0) and
- * multiplying by white is a no-op — the tile's own colour passes through
- * completely untouched. This is the layer that fixes the readability bug;
- * get it right and the strand layer below is purely cosmetic on top of it.
+ * Крок 10, Section A — the readability rebuild. Alpha, not multiply, is the
+ * primary mechanism again: THREE.MultiplyBlending (Крок 9.5) could only ever
+ * scale the framebuffer, never truly hide it, so even "readable" deep fog
+ * still let a careful look tell a light tile from a dark one. Plain alpha
+ * reaching FOG_MAX_ALPHA (0.94) in the deep field means whatever's
+ * underneath contributes at most 6% of the final pixel — provably below the
+ * "< 6 luma difference" verification bar, not just tuned to look right.
+ *
+ * `uOpacity` here is each layer's own alpha multiplier (1.0 for the base
+ * layer, falling off fast for the raised ones — see FOG_LAYER_ALPHA_MULT),
+ * not a single global knob anymore.
+ *
+ * `uSurfaceStart`/`uSurfaceEnd` — Section B's "top surface": an extra
+ * smoothstep gate on `density` so a raised layer only appears where the fog
+ * beneath it is *already* substantially deep, tapering to nothing at the
+ * frontier. The base layer's gate is [0, 0] (smoothstep degenerates to "on"
+ * for any density > 0), so it alone still reproduces Section A's curve
+ * exactly, unrestricted — raised layers are silhouette riding on top of it,
+ * never a second source of readability.
+ *
+ * `uColorMid` and `colorVariance` fix a bug the brief's own verification
+ * step caught: mixing the full uColorLow-uColorHigh range (a ~37-luma
+ * spread) at every density meant two *adjacent* deep-fog pixels could land
+ * on different points of that range purely from noise phase, independent of
+ * which tile was underneath — measured, this alone produced a bigger luma
+ * delta between two deep-fogged neighbours than the "< 6" bar allows, before
+ * the underlying tile ever entered into it. The brief's own colour range is
+ * for the frontier ("на межі — м'який градієнт, це те, що розповідає
+ * історію"); the deep interior is supposed to be "глухо" — muffled, uniform,
+ * not textured — so `colorVariance` fades the noise mix out as density rises
+ * past the alpha knee, converging on a single flat `uColorMid` deep in the
+ * field instead of continuing to swing across the full range.
  */
-function multiplyFragmentShaderSource() {
+function layerFragmentShaderSource() {
+  return /* glsl */ `
+    ${sharedUniformsAndNoiseGLSL()}
+    uniform vec3 uColorLow;
+    uniform vec3 uColorHigh;
+    uniform vec3 uColorMid;
+    uniform float uSurfaceStart;
+    uniform float uSurfaceEnd;
+
+    void main() {
+      ${densityAndShapeGLSL()}
+
+      float surface = uSurfaceEnd > uSurfaceStart
+        ? smoothstep(uSurfaceStart, uSurfaceEnd, density)
+        : step(uSurfaceStart, density);
+      float alpha = smoothstep(0.0, ${FOG_ALPHA_KNEE.toFixed(3)}, density)
+        * ${FOG_MAX_ALPHA.toFixed(3)} * uOpacity * surface;
+      if (alpha < 0.002) discard;
+
+      vec3 noisyColor = mix(uColorLow, uColorHigh, shaped);
+      float colorVariance = 1.0 - smoothstep(${FOG_ALPHA_KNEE.toFixed(3)}, 1.0, density);
+      vec3 color = mix(uColorMid, noisyColor, colorVariance);
+      gl_FragColor = vec4(color, alpha);
+    }
+  `;
+}
+
+/*
+ * The one surviving multiply pass, demoted from "the mechanism" (Крок 9.5)
+ * to "a little extra depth right at the frontier" (Крок 10). Windowed to
+ * density 0.15-0.5 so it touches neither the fully clear zone (nothing to
+ * darken) nor the deep interior (already opaque — multiplying an already-
+ * 94%-covered pixel toward a tint is imperceptible and not worth the ALU).
+ * Mounted once, on the base layer only — raised layers are silhouette and
+ * don't need their own edge treatment.
+ */
+function edgeMultiplyFragmentShaderSource() {
   return /* glsl */ `
     ${sharedUniformsAndNoiseGLSL()}
     uniform vec3 uTint;
@@ -157,82 +258,98 @@ function multiplyFragmentShaderSource() {
     void main() {
       ${densityAndShapeGLSL()}
 
-      if (density < 0.002) discard;
+      float band = smoothstep(0.15, 0.3, density) * (1.0 - smoothstep(0.35, 0.5, density));
+      if (band < 0.002) discard;
 
-      vec3 base = mix(vec3(1.0), uTint, clamp(density * uOpacity, 0.0, 1.0));
+      vec3 base = mix(vec3(1.0), uTint, band * 0.5);
       gl_FragColor = vec4(base, 1.0);
     }
   `;
 }
 
-/*
- * Крок 9.5, Component 2 — the pale wisp threads, laid on top of the
- * darkened base as a normal alpha overlay. This is visually almost the same
- * pattern the old single-layer shader painted, but it no longer has to also
- * carry the "is this square fogged at all" job — that's the multiply layer's
- * job now — so this one can stay a pale, high-contrast overlay without
- * worrying about disappearing into a light tile itself.
- */
-function strandsFragmentShaderSource() {
-  return /* glsl */ `
-    ${sharedUniformsAndNoiseGLSL()}
-    uniform vec3 uStrandColor;
-
-    void main() {
-      ${densityAndShapeGLSL()}
-
-      float alpha = shaped * density * 0.5 * uOpacity;
-      if (alpha < 0.002) discard;
-
-      gl_FragColor = vec4(uStrandColor, alpha);
-    }
-  `;
-}
-
-function makeMultiplyMaterial(mask, { opacity, scale, driftScale, edgeGain }) {
+function makeLayerMaterial(mask, params) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uMask: { value: mask },
       uTime: { value: 0 },
-      uOpacity: { value: opacity },
-      uScale: { value: scale },
-      uDriftScale: { value: driftScale },
-      uEdgeGain: { value: edgeGain },
+      uOpacity: { value: params.alphaMult },
+      uScale: { value: params.scale },
+      uDriftScale: { value: params.driftScale },
+      uDriftAngle: { value: params.driftAngle },
+      uUvOffset: { value: new THREE.Vector2(params.uvOffset[0], params.uvOffset[1]) },
+      uEdgeGain: { value: params.edgeGain },
+      uColorLow: { value: new THREE.Color(FOG_DEPTH_COLOR_LOW) },
+      uColorHigh: { value: new THREE.Color(FOG_DEPTH_COLOR_HIGH) },
+      uColorMid: { value: new THREE.Color(FOG_DEPTH_COLOR_MID) },
+      uSurfaceStart: { value: params.surfaceStart },
+      uSurfaceEnd: { value: params.surfaceEnd },
+    },
+    vertexShader: VERTEX_SHADER,
+    fragmentShader: layerFragmentShaderSource(),
+    transparent: true,
+    depthWrite: false,
+  });
+}
+
+function makeEdgeMultiplyMaterial(mask, params) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMask: { value: mask },
+      uTime: { value: 0 },
+      uOpacity: { value: 1 },
+      uScale: { value: params.scale },
+      uDriftScale: { value: params.driftScale },
+      uDriftAngle: { value: params.driftAngle },
+      uUvOffset: { value: new THREE.Vector2(0, 0) },
+      uEdgeGain: { value: params.edgeGain },
       uTint: { value: new THREE.Color(FOG_TINT_COLOR) },
     },
     vertexShader: VERTEX_SHADER,
-    fragmentShader: multiplyFragmentShaderSource(),
+    fragmentShader: edgeMultiplyFragmentShaderSource(),
     transparent: true,
     depthWrite: false,
-    // The whole point of this layer: scale the destination instead of
-    // painting over it.
     blending: THREE.MultiplyBlending,
   });
 }
 
-function makeStrandsMaterial(mask, { opacity, scale, driftScale, edgeGain }) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uMask: { value: mask },
-      uTime: { value: 0 },
-      uOpacity: { value: opacity },
-      uScale: { value: scale },
-      uDriftScale: { value: driftScale },
-      uEdgeGain: { value: edgeGain },
-      uStrandColor: { value: new THREE.Color(FOG_STRAND_COLOR) },
-    },
-    vertexShader: VERTEX_SHADER,
-    fragmentShader: strandsFragmentShaderSource(),
-    transparent: true,
-    depthWrite: false,
-  });
+/*
+ * Крок 10, Section B: per-layer tuning, derived from index rather than
+ * hand-picked per layer, so FOG_LAYERS can drop from 5 to 2 (the perf
+ * ladder's first lever) without leaving orphaned config behind.
+ *
+ * - scale grows with height ("масштаб шуму зростає з висотою"): higher
+ *   layers get finer-grained noise.
+ * - driftAngle spreads layers around a circle so no two drift the same way;
+ *   driftScale alternates sign and grows slightly so speed differs too.
+ * - uvOffset is proportional to height, in a fixed (non-height-dependent)
+ *   direction — see densityAndShapeGLSL's own comment for why this exists
+ *   alongside the real geometric parallax the height difference already
+ *   gives for free.
+ * - surfaceStart/End step up with height: the base layer (index 0) is
+ *   unrestricted ([0, 0]), each layer above needs progressively deeper fog
+ *   beneath it before it shows at all, tapering the whole stack's silhouette
+ *   to nothing at the frontier instead of a hard-edged wall of planes.
+ */
+function layerParams(index, height) {
+  const driftSign = index % 2 === 0 ? 1 : -1;
+  return {
+    height,
+    alphaMult: FOG_LAYER_ALPHA_MULT[index],
+    scale: 1.0 + index * 0.35,
+    driftScale: driftSign * (1.0 + index * 0.12),
+    driftAngle: index * 0.9,
+    uvOffset: [height * 0.8, height * -0.55],
+    edgeGain: index === 0 ? 0.35 : 0.12,
+    surfaceStart: index === 0 ? 0 : index * 0.1,
+    surfaceEnd: index === 0 ? 0 : index * 0.1 + 0.22,
+  };
 }
 
 export default function FogShader({ visibility }) {
   const current = useRef(new Float32Array(64));
   const target = useRef(new Float32Array(64));
 
-  const { mask, groundMultiply, groundStrands, driftStrands } = useMemo(() => {
+  const { mask, layers, edgeMultiply } = useMemo(() => {
     const data = new Float32Array(64); // 1 = visible, 0 = fogged
     const texture = new THREE.DataTexture(data, 8, 8, THREE.RedFormat, THREE.FloatType);
     texture.minFilter = THREE.LinearFilter;
@@ -241,55 +358,35 @@ export default function FogShader({ visibility }) {
     texture.wrapT = THREE.ClampToEdgeWrapping;
     texture.needsUpdate = true;
 
-    // uScale multiplies the shader's literal per-layer base scales
-    // (3.0/4.0/11.0), so 1.0 is "as specified" and >1 is finer-grained.
-    const groundParams = { opacity: FOG_OPACITY, scale: 1.0, driftScale: 1.0, edgeGain: 0.35 };
+    const builtLayers = FOG_LAYER_HEIGHTS.slice(0, FOG_LAYERS).map((height, i) => {
+      const params = layerParams(i, height);
+      return { height, material: makeLayerMaterial(texture, params) };
+    });
 
     return {
       mask: texture,
-      groundMultiply: makeMultiplyMaterial(texture, groundParams),
-      groundStrands: makeStrandsMaterial(texture, groundParams),
-      // Second, higher sheet at a finer grain and a mirrored (negative)
-      // drift rate. The parallax between the two sells volume without a real
-      // volumetric pass. Its opacity is deliberately tiny: anything raised
-      // above the board occludes far squares at shallow camera angles, which
-      // is the exact problem that put the main fog on the ground in the
-      // first place. It's a strands-only layer, not multiply-darken-and-
-      // strands: its job is faint drifting texture on top of a base the
-      // ground layer already darkened, not readability on its own.
-      //
-      // Skipped entirely (not just rendered at zero alpha) when
-      // FOG_DRIFT_OPACITY is 0 — this is the first item on lib/fog.js's
-      // performance ladder, and it only actually saves anything if the
-      // second draw call, and the shader compile behind it, never happen.
-      driftStrands:
-        FOG_DRIFT_OPACITY > 0
-          ? makeStrandsMaterial(texture, {
-              opacity: FOG_DRIFT_OPACITY,
-              scale: 1.7,
-              driftScale: -1.7,
-              edgeGain: 0.0,
-            })
-          : null,
+      layers: builtLayers,
+      // Mounted against the base layer's own params (index 0) so its noise
+      // sampling lines up with what it's adding depth on top of.
+      edgeMultiply: makeEdgeMultiplyMaterial(texture, layerParams(0, FOG_LAYER_HEIGHTS[0])),
     };
   }, []);
 
   useEffect(
     () => () => {
-      groundMultiply.dispose();
-      groundStrands.dispose();
-      driftStrands?.dispose();
+      layers.forEach((l) => l.material.dispose());
+      edgeMultiply.dispose();
       mask.dispose();
     },
-    [groundMultiply, groundStrands, driftStrands, mask],
+    [layers, edgeMultiply, mask],
   );
 
   // QA hook, gated the same way HUD's ?debug=1 readout is: lets a script
   // inspect the live mask/uniform state instead of guessing from pixels.
   useEffect(() => {
     if (typeof window === 'undefined' || !window.location.search.includes('debug')) return;
-    window.__fogMaterials = { groundMultiply, groundStrands, driftStrands, mask };
-  }, [groundMultiply, groundStrands, driftStrands, mask]);
+    window.__fogMaterials = { layers, edgeMultiply, mask };
+  }, [layers, edgeMultiply, mask]);
 
   useFrame((_, delta) => {
     for (let i = 0; i < 64; i++) {
@@ -306,33 +403,33 @@ export default function FogShader({ visibility }) {
     }
     mask.needsUpdate = true;
 
-    groundMultiply.uniforms.uTime.value += delta;
-    groundStrands.uniforms.uTime.value += delta;
-    if (driftStrands) driftStrands.uniforms.uTime.value += delta;
+    layers.forEach((l) => {
+      l.material.uniforms.uTime.value += delta;
+    });
+    edgeMultiply.uniforms.uTime.value += delta;
   });
 
   return (
     <group>
-      {/* Multiply pass first, strands pass second, same height: the strands
-          alpha-composite on top of whatever the multiply pass already
-          darkened. Order matters here — three.js draws transparent objects
-          in the order given when renderOrder ties, and these are given
-          explicit, adjacent renderOrder values so that's never left to
-          chance. */}
-      <mesh position={[0, FOG_HEIGHT, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
-        <planeGeometry args={[8, 8]} />
-        <primitive object={groundMultiply} attach="material" />
-      </mesh>
-      <mesh position={[0, FOG_HEIGHT, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={3}>
-        <planeGeometry args={[8, 8]} />
-        <primitive object={groundStrands} attach="material" />
-      </mesh>
-      {driftStrands && (
-        <mesh position={[0, FOG_DRIFT_HEIGHT, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={4}>
+      {layers.map((l, i) => (
+        <mesh
+          key={i}
+          position={[0, l.height, 0]}
+          rotation={[-Math.PI / 2, 0, 0]}
+          renderOrder={2 + i}
+        >
           <planeGeometry args={[8, 8]} />
-          <primitive object={driftStrands} attach="material" />
+          <primitive object={l.material} attach="material" />
         </mesh>
-      )}
+      ))}
+      {/* Same height as the base layer, but drawn last (highest renderOrder)
+          so its multiply darkens whatever the whole layer stack has already
+          composited in the transition band, base included — a subtle final
+          pass, not a step wedged between two alpha layers. */}
+      <mesh position={[0, FOG_LAYER_HEIGHTS[0], 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2 + FOG_LAYERS}>
+        <planeGeometry args={[8, 8]} />
+        <primitive object={edgeMultiply} attach="material" />
+      </mesh>
     </group>
   );
 }
