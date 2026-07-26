@@ -510,14 +510,17 @@ touching this curve again:**
    gate — it's genuinely nonzero on *both* sides of a boundary, but the
    thickening effect belongs only on the fogged side.
 
-**Крок 10, Section B gave fog height.** `FogShader.jsx` renders `FOG_LAYERS`
-(5) planes instead of one, at `FOG_LAYER_HEIGHTS` (0.02/0.07/0.14/0.23/0.34)
-with `FOG_LAYER_ALPHA_MULT` (1.0/0.55/0.35/0.2/0.1) — the base layer alone
-reproduces Section A's curve exactly and carries all of the readability
-guarantee; every layer above it is silhouette, never a second source of
-occlusion. Per-layer variation (`layerParams()` in `FogShader.jsx`, derived
-from index, not hand-picked, so `FOG_LAYERS` can drop 5→2 without leaving
-orphaned config):
+**Крок 10, Section B gave fog height.** Originally `FOG_LAYERS` (5) real
+planes instead of one; **Крок 11, Section A made the height virtual** — one
+plane now, with `FOG_LAYER_HEIGHTS` (0.02/0.07/0.14/0.23/0.34) driving a
+per-slice view-direction parallax shift inside a single fragment shader
+instead of five real mesh positions (see "Крок 11, Section A" further down
+for why). `FOG_LAYER_ALPHA_MULT` (1.0/0.55/0.35/0.2/0.1) still applies the
+same way — the base slice alone reproduces Section A's curve exactly and
+carries all of the readability guarantee; every slice above it is
+silhouette, never a second source of occlusion. Per-slice variation
+(`layerParams()` in `FogShader.jsx`, derived from index, not hand-picked, so
+`FOG_LAYERS` can drop 5→2 without leaving orphaned config):
 
 - **Noise scale grows with height** (`1.0 + index * 0.35`) — higher layers
   read finer-grained.
@@ -552,17 +555,20 @@ regardless of how many layers are stacked overhead — each layer
 independently zeroes out over a genuinely visible square, so stacking more
 of them adds silhouette over fog, never haze over clarity.
 
-Performance ladder, in order, if frame rate drops below 50: `FOG_LAYERS` 5 ->
-4 -> 3 -> 2 (drops both draw calls and the noise evaluations behind them —
-the biggest lever, cut first), then `FOG_DETAIL_OCTAVES` 5 -> 3, then
-`FOG_ENABLE_DETAIL` -> false (drops the third noise scale entirely, and its
-GLSL function is not even included in the shader source when false). **Real-
-GPU frame rate is unmeasured from this environment** — see "Headless browser"
-below; the software rasterizer here renders at roughly 1 fps regardless of
-scene complexity, so it cannot distinguish 30 fps from 60. Five layers at
-five-octave ridged noise each is meaningfully more per-pixel cost than the
-two-sheet Крок 9.5 version — verify on real hardware before trusting the
-default `FOG_LAYERS = 5`.
+**Superseded by Крок 11, Section A (see below):** this paragraph originally
+described a performance ladder built around `FOG_DETAIL_OCTAVES` and
+`FOG_ENABLE_DETAIL`, which no longer exist — fog noise is a baked texture
+now (`getFogNoiseTexture()`), not a GLSL octave loop with a tunable count,
+and fog is already one draw call, not five, so `FOG_LAYERS` no longer trades
+against draw-call count either. If frame rate still drops on real hardware,
+`FOG_LAYERS` 5 -> 2 remains the lever (fewer slices composited per pixel in
+the single shader), just for a smaller win than it used to be, since the
+expensive part (from-scratch noise) is already gone. **Real-GPU frame rate
+is unmeasured from this environment** — see "Headless browser" below; the
+software rasterizer here renders at roughly 1 fps regardless of scene
+complexity, so it cannot distinguish 30 fps from 60. A `requestAnimationFrame`
+counter behind `?debug=1` (`HUD.jsx`'s `FpsCounter`) exists specifically so
+this can be checked on real hardware without a rebuild.
 
 **The fog's base layer sits at y=0.02, just above the tiles — not above the
 pieces.** Floating it over the pieces (the obvious reading of "above the
@@ -570,9 +576,22 @@ pieces") means a shallow camera looks through every fogged square between it
 and a distant piece, washing the whole board out. Nothing ever pokes through
 at ground level: a square holding one of your own pieces is always visible so
 never fogged, and enemy pieces inside fog are not rendered at all.
-Move-highlights sit at `HIGHLIGHT_HEIGHT` — now above the *tallest* fog layer
-(0.34 + 0.02) rather than a fixed 0.07 — so legal-move markers stay crisp on
-squares you have not explored, even through the raised silhouette layers.
+**Крок 11, Section B moved `HIGHLIGHT_HEIGHT` down to 0.011** — right on the
+tile, under every fog layer — but kept the highlight mesh's `renderOrder`
+*above* the fog's own (`Board.jsx`: highlight 4, fog mesh 3). Both alpha
+layers have `depthWrite: false`, so with no depth conflict between them,
+render order — not world Y — is what actually decides whether fog can paint
+over the highlight; the height move alone would have done nothing either
+way. This isn't just future-proofing: the brief's own justification for
+"safe to hide the highlight under fog" ("a legal target is always inside the
+mover's zone of control, so it's always visible") is false for a pawn's
+double-push — `lib/visibility.js` builds `visibility` from `attackers()`,
+and a pawn doesn't attack two ranks ahead, only diagonally. Verified with a
+headless-Playwright pixel sample: selecting e2 and sampling the rendered
+frame, e3 read as clear ember but e4 (the double-push target, buried under
+fog's 0.94 max alpha) read as flat fog grey with the old renderOrder — fixed
+once the highlight was guaranteed to composite on top regardless of fog
+state.
 
 **Крок 10, Section C made a move an event instead of an instant mask swap.**
 The mask `DataTexture` grew a second channel (`THREE.RGFormat`, not `RedFormat`
@@ -668,6 +687,104 @@ spot on a symmetric start position. `/dev-fog?visible=a1` renders top-down
 with only the listed squares cleared and paints them orange — the clear hole
 must land on the orange square. Corners alone do not prove it (they are
 invariant under mirroring); use a single asymmetric square.
+
+### Крок 11, Section A: one draw call instead of six
+
+The diagnosis going in: five fog planes, each computing three from-scratch
+noise functions (one fbm + two ridged, five octaves each) per pixel, plus a
+sixth mesh for the edge-multiply tint — six draw calls, ~15 noise-octave
+evaluations per pixel per plane before transparent overdraw even multiplies
+it further. Two structural changes, not tuning:
+
+- **Noise from a texture, not from scratch.** `getFogNoiseTexture()`
+  (`proceduralTextures.js`) bakes a 256x256 RGBA texture once at module
+  load: each channel is an independently *seamless* tileable value-noise
+  field (hash taken modulo a per-channel lattice period that evenly divides
+  the sampling range — R/G/B/A at periods 4/8/16/32, i.e. doubling
+  frequency). `FogShader.jsx`'s `fbmTex`/`ridgedTex` replace the old GLSL
+  octave loops with **one texture2D fetch** each — the four channels of a
+  single sample already *are* four pre-computed octaves, combined with the
+  same 0.5/0.25/0.125/0.0625 amplitude falloff the loop used. Visually the
+  same lattice, just baked instead of computed; doesn't survive a
+  screenshot comparison.
+- **One plane, five virtual slices.** `FOG_LAYERS` "planes" (still the same
+  `lib/fog.js` constant, still drives everything, still safe to drop 5->2)
+  are now one mesh, sliced inside a single fragment shader. A slice's old
+  real height — which used to buy real geometric parallax as the camera
+  orbited — is faked with a UV shift along the camera's own view direction
+  (`FOG_PARALLAX_STRENGTH`). `sliceGLSL()` JS-templates one unrolled block
+  per slice (same pattern `ridgedGLSL` used to be), composited into `accum`
+  with the exact src-over recurrence (`rgb*a + accum.rgb*(1-a)`, `a +
+  accum.a*(1-a)`) that stacking N real transparent draws would already have
+  produced — same math, one draw call. Verified via a headless-Playwright
+  scene traversal counting meshes carrying the fog material: 1 (was 6). The
+  old edge-multiply mesh's tint is folded into slice 0's own colour instead
+  of surviving as a second `MultiplyBlending` draw — an approximation (a
+  direct colour mix, not a true multiply of the framebuffer beneath it),
+  acceptable since Крок 10 had already demoted it to "a little extra depth
+  at the frontier," not the readability mechanism.
+- `ownVisible`/`edge`'s safety property (Крок 10 Section B) is unchanged:
+  both still key off the true, texel-snapped `vUv` (never the
+  parallax-shifted noise sample), so a visible square reads density 0 on
+  every slice regardless of how far a raised slice's noise field has
+  drifted.
+
+Also (`GameCanvas.jsx`/`Lighting.jsx`): `dpr={[1, 1.5]}` (was unclamped —
+a 2x/3x-density display was rendering 4x-9x the pixels a 1x display does
+for an identical frame), key light `shadow-mapSize` 2048->1024 (it was
+already the only shadow-casting light), `gl={{ powerPreference:
+'high-performance' }}`.
+
+**Real-hardware FPS is unmeasured from this environment**, same limitation
+as everywhere else in this file that touches frame rate — the headless
+software rasterizer here renders at ~1fps regardless of scene complexity
+and cannot distinguish 30 from 60. A plain `requestAnimationFrame`-based
+counter now sits next to the `?debug=1` vision readout in `HUD.jsx`
+(`FpsCounter`, a rolling 500ms window, deliberately outside the r3f tree so
+it measures the browser's real paint rate) specifically so this can be
+checked in a real browser without a rebuild — read it there, don't trust a
+number reported from this environment.
+
+### Крок 11, Section D: a breathing frontier, and why the obvious approach doesn't work here
+
+The brief's own sketch was `density += edgeShift * band` where `band` is a
+smoothstep window on `density` itself, assuming `density` ramps smoothly
+through 0..1 near a boundary. It doesn't, in this codebase's model: a
+*settled* (non-transitioning) fogged cell has `ownVisible` pinned at exactly
+0.0 — only mid-wave does the R channel take intermediate values — which
+puts baseline `density` at exactly 1.0 or above, already past
+`FOG_ALPHA_KNEE` and therefore already saturating both
+`smoothstep(0, KNEE, density)` (alpha) and `smoothstep(KNEE, 1.0, density)`
+(colour variance). Adding a small oscillation on top of an already-saturated
+value changes nothing. This was **verified empirically, not assumed**: a
+headless-Playwright session forced `uTime` 500 units apart and read back raw
+pixels via `gl.readPixels` (bypassing PNG/screenshot entirely) at the exact
+frontier band — byte-identical output. The same method also suggests the
+Крок 10 Section D "boiling edge" may have had the identical characteristic
+(never rigorously checked for temporal variation at the time, only for the
+adjacent-pixel luma bars) — worth keeping in mind if it's ever revisited.
+
+The fix moves *where* the boundary is tested, not the density value at a
+fixed position: `breathedUv = vUv + vec2(breathShift) / 8.0` (breathShift in
+fractions-of-a-cell, matching the brief's own units) is what gets sampled
+for `ownVisible` and the edge gradient, in place of plain `vUv`. Only pixels
+already within about that same tiny distance of a *true* mask boundary can
+have their `ownVisible` read flip to a different texel as a result — a
+cell's own centre would need a shift past half its width to ever reach a
+neighbouring texel, far more than `breathShift` produces, so "density at
+cell centres stays exactly as the mask says" holds by construction. Two
+superimposed ripples (`FOG_BREATH_PERIOD_SLOW` 0.28, `FOG_BREATH_PERIOD_FAST`
+0.73 with a `dot(vUv, vec2(13,7))` phase offset so it ripples rather than
+pulsing in lockstep) combine into one `breathShift`, gated to 0 for the
+first `FOG_WAVE_DURATION` (0.8s, reusing the existing constant rather than
+adding a second one) after *this square's own* last visibility change —
+read from the mask's own B channel (`ownMask0.b`, now the third channel:
+the mask `DataTexture` is RGBA, not RG, as of this pass) — and eased back in
+over that span, so breathing never fights the Крок 10 Section C reveal wave.
+Verified with the same forced-`uTime`/`gl.readPixels` method: comparing
+render output across ten different `uTime` values against a fixed baseline
+all showed substantial, non-trivial pixel diffs (1,200-9,000 pixels, colour
+delta up to 225/255) at the frontier band specifically.
 
 ## Camera and environment
 
@@ -1084,13 +1201,30 @@ comment. If that shot reads as floating in open void rather than pushing low
 across a landscape, it needs revisiting once the real rock model (or even
 just the temporary pedestal) has been checked from that exact angle.
 
+**Крок 11, Section C colours the rock.** Inspecting the glTF JSON directly
+(reading `meshes`/`materials` out of the `.glb`'s own JSON chunk — no loader
+needed) confirmed one mesh, one material: the "все одним мешем" case, not a
+per-part material swap. `ROCK_MATERIAL.onBeforeCompile` injects a geometry
+mask into `MeshStandardMaterial`'s own fragment shader (`vLocalPos`, the raw
+pre-transform `position` attribute, carried through via a new varying) —
+`STONE_DEEP`->`STONE_TOP` vertical gradient by local Y, `FOLIAGE` where
+`radius > 0.6..0.8 * maxRadius` (smoothstepped, not a hard cutoff — a binary
+threshold on flat-shaded low-poly geometry facets visibly) `&& heightFrac >
+0.5..0.65`. `ROCK_MIN_Y`/`ROCK_HEIGHT`/`ROCK_MAX_RADIUS` come straight from
+the position accessor's own declared `min`/`max` (glTF requires these stay
+correct even under Draco compression), not a second raycast pass. This keeps
+real PBR lighting (environment reflections, the rim light, shadow
+receiving) — only where the diffuse colour itself comes from is overridden.
+
 Roughness/normal-map generation (fbm-based canvas textures) still lives in
-`components/proceduralTextures.js` for the two things that still use it — the
-backdrop's edge alpha map and the board tile roughness — even though the
-plateau-specific maps are gone. It's in `components/` rather than `lib/`
-because it constructs `THREE.Texture` objects, and fbm itself is not tileable,
-so anything with `repeat > 1` there uses `MirroredRepeatWrapping` — plain
-repeat leaves a grid of seams.
+`components/proceduralTextures.js` for the backdrop's edge alpha map, the
+board tile roughness, and (Крок 11, Section A1) the fog noise texture — even
+though the plateau-specific maps are gone. It's in `components/` rather than
+`lib/` because it constructs `THREE.Texture` objects, and fbm itself is not
+tileable, so anything with `repeat > 1` there uses `MirroredRepeatWrapping` —
+plain repeat leaves a grid of seams. (The fog noise texture is the
+exception: it's tileable by construction — see "Fog" below — so it uses
+plain `RepeatWrapping`.)
 
 ## Intro
 
