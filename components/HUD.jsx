@@ -109,6 +109,43 @@ function ControlHint() {
   );
 }
 
+/*
+ * Крок 11, Section A: this environment's headless browser renders at ~1fps
+ * regardless of scene complexity (see CLAUDE.md's "Headless browser"
+ * section) — real GPU frame rate can only be checked in an actual browser.
+ * This is that check: a plain DOM-level requestAnimationFrame counter,
+ * outside the r3f tree entirely, so it measures the browser's real paint
+ * rate rather than anything the Canvas's own render loop reports. Averaged
+ * over a rolling 500ms window and only committed to React state on that
+ * cadence — updating every rAF tick would itself be the kind of per-frame
+ * setState this codebase avoids elsewhere (CameraRig, FogLayer, the
+ * hover-lift) for the same reason.
+ */
+function FpsCounter() {
+  const [fps, setFps] = useState(0);
+
+  useEffect(() => {
+    let frames = 0;
+    let windowStart = performance.now();
+    let rafId;
+
+    const tick = (now) => {
+      frames += 1;
+      const elapsed = now - windowStart;
+      if (elapsed >= 500) {
+        setFps(Math.round((frames * 1000) / elapsed));
+        frames = 0;
+        windowStart = now;
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+
+  return <>{fps} fps</>;
+}
+
 /** The large check/checkmate flash — same ember as the board's own move highlight. */
 function StatusFlash({ text }) {
   return (
@@ -214,7 +251,7 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
                   fontVariantNumeric: 'tabular-nums',
                 }}
               >
-                visible: {visibleCount} / 64
+                visible: {visibleCount} / 64 · <FpsCounter />
               </div>
             )}
           </div>

@@ -242,7 +242,15 @@ export default function GameCanvas() {
           read as unfinished. */}
       <Canvas
         shadows
-        gl={{ alpha: true, toneMapping: TONE_MAPPING }}
+        // Крок 11, Section A3: dpr was unclamped, so a high-density display
+        // (2x/3x devicePixelRatio) was rendering 4x-9x the pixels a 1x
+        // display does for the exact same frame — the single biggest lever
+        // available outside the fog shader itself. Capped at 1.5, not 1:
+        // 1.5 still reads noticeably sharper than 1x on a Retina-class
+        // screen, just not the full (and mostly wasted, past normal viewing
+        // distance) native density.
+        dpr={[1, 1.5]}
+        gl={{ alpha: true, toneMapping: TONE_MAPPING, powerPreference: 'high-performance', antialias: true }}
         onCreated={({ gl }) => {
           gl.toneMappingExposure = tuning.exposure ?? EXPOSURE;
         }}

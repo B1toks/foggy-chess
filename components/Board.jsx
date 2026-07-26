@@ -197,7 +197,34 @@ export default function Board({
               <mesh
                 position={[x, y + HIGHLIGHT_HEIGHT, z]}
                 rotation={[-Math.PI / 2, 0, 0]}
-                renderOrder={3}
+                // Крок 11, Section B: HIGHLIGHT_HEIGHT was lowered to sit
+                // right on the tile (0.011), but the brief's own safety
+                // argument for that ("a legal target is always inside the
+                // mover's zone of control, so it's always visible, so fog
+                // never covers it") turned out not to hold universally —
+                // verified with a headless Playwright pixel sample:
+                // selecting the e2 pawn and sampling the rendered frame at
+                // e3 (single push) reads clear ember, but e4 (the double
+                // push, a legal opening move) reads as flat fog grey, no
+                // ember tint at all. The reason: lib/visibility.js builds
+                // `visibility` from game.attackers() (correctly, per its own
+                // comment — that's real attack/defend geometry), and a pawn
+                // does not attack the square two ranks ahead of it, only
+                // diagonally. So a double-push target is a genuine legal
+                // target that sits outside `visibility` and gets the fog
+                // shader's ~0.94 max alpha on top of it.
+                //
+                // Since transparent draws with depthWrite:false composite in
+                // renderOrder, not world-Y, order — not height — is what
+                // actually controls whether fog can occlude the highlight.
+                // renderOrder={4} (fog's single mesh is 3) keeps the
+                // highlight compositing on top of fog unconditionally, so
+                // every legal target stays visible regardless of whether
+                // lib/visibility.js's attack-geometry definition happens to
+                // cover that specific square — while HIGHLIGHT_HEIGHT still
+                // moved down to sit snugly on the tile, per the rest of the
+                // brief's ask.
+                renderOrder={4}
               >
                 <planeGeometry args={[0.92, 0.92]} />
                 <meshBasicMaterial

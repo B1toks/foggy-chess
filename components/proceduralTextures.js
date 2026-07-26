@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { fbm } from '../lib/noise';
+import { fbm, hash2 } from '../lib/noise';
 
 /*
  * Canvas-generated maps for the backdrop edge fade and the board tiles.
@@ -149,4 +149,87 @@ export function getBoardRoughnessMap() {
   ctx.putImageData(image, 0, 0);
   boardRoughness = finish(canvas);
   return boardRoughness;
+}
+
+// Лattice period (in cells) baked into each channel — R lowest-frequency,
+// A highest. Doubling each step is what the brief's "R базова, G вдвічі
+// дрібніша, B ще вдвічі, A найдрібніша" describes.
+const FOG_NOISE_CHANNEL_PERIODS = [4, 8, 16, 32];
+
+/**
+ * Tileable value noise: identical to lib/noise.js's valueNoise, except the
+ * lattice hash is taken modulo `period` first. Since the texture is sampled
+ * with exactly `period` lattice cells across its width (see getFogNoiseTexture
+ * below — x/size * period ranges 0..period as x ranges 0..size), the cell at
+ * the tile's right/bottom edge hashes identically to the cell at its left/top
+ * edge, so RepeatWrapping tiles it with no seam — unlike lib/noise.js's plain
+ * fbm/valueNoise, which is not periodic and was never meant to be sampled
+ * with wraparound.
+ */
+function tileableValueNoise(x, y, period) {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+
+  const wrap = (v) => ((v % period) + period) % period;
+  const h = (cx, cy) => hash2(wrap(cx), wrap(cy));
+
+  const a = h(ix, iy);
+  const b = h(ix + 1, iy);
+  const c = h(ix, iy + 1);
+  const d = h(ix + 1, iy + 1);
+  return (a * (1 - ux) + b * ux) * (1 - uy) + (c * (1 - ux) + d * ux) * uy;
+}
+
+let fogNoiseTexture = null;
+/**
+ * Крок 11, Section A1: the fog shader used to compute fbm/ridged noise from
+ * scratch per pixel — three separate noise functions (mass/wisps/detail),
+ * each five octaves, each octave four hash() calls — on every one of five
+ * stacked fog planes. That's the actual GPU cost the perf pass targets, not
+ * a minor overdraw issue.
+ *
+ * This bakes all of that into one 256x256 RGBA texture, once, at module
+ * load: each channel is an independently-seamless tileable noise field at
+ * double the previous channel's frequency (FOG_NOISE_CHANNEL_PERIODS). A
+ * single texture2D fetch then returns four already-computed frequency bands
+ * at once — FogShader.jsx's fbmTex/ridgedTex combine them with the same
+ * amplitude falloff (0.5/0.25/0.125/0.0625) the original octave loop used,
+ * so one hardware-filtered sample stands in for what used to be a four-
+ * octave CPU-style loop. Visually equivalent (it's the same value-noise
+ * lattice, just four fixed octaves instead of five computed ones); the
+ * difference doesn't survive a screenshot.
+ */
+export function getFogNoiseTexture() {
+  if (fogNoiseTexture) return fogNoiseTexture;
+
+  const size = 256;
+  const canvas = makeCanvas(size);
+  const ctx = canvas.getContext('2d');
+  const image = ctx.createImageData(size, size);
+  const data = image.data;
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      for (let ch = 0; ch < 4; ch++) {
+        const period = FOG_NOISE_CHANNEL_PERIODS[ch];
+        const n = tileableValueNoise((x / size) * period, (y / size) * period, period);
+        data[i + ch] = Math.round(255 * n);
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+
+  fogNoiseTexture = new THREE.CanvasTexture(canvas);
+  fogNoiseTexture.wrapS = THREE.RepeatWrapping;
+  fogNoiseTexture.wrapT = THREE.RepeatWrapping;
+  fogNoiseTexture.colorSpace = THREE.NoColorSpace;
+  fogNoiseTexture.minFilter = THREE.LinearFilter;
+  fogNoiseTexture.magFilter = THREE.LinearFilter;
+  fogNoiseTexture.needsUpdate = true;
+  return fogNoiseTexture;
 }

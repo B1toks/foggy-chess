@@ -54,12 +54,17 @@ export default function Lighting({ preset, envIntensity = ENV_INTENSITY }) {
           it, and left unchanged the sum blows the board out to white. */}
       <ambientLight intensity={0.05} />
 
-      {/* key — primary form and the only shadow caster */}
+      {/* key — primary form and the only shadow caster. shadow-mapSize
+          1024 (Крок 11, Section A3; was 2048) — halves the shadow pass's
+          own render-target cost. Board/pieces are close-range and small
+          (shadow-camera bounds are +/-6 units), so 1024 still resolves
+          crisp piece-base contact shadows; verify by eye if a future piece
+          set adds finer detail near the shadow's own resolution limit. */}
       <directionalLight
         position={[4, 6, 3]}
         intensity={0.85}
         castShadow
-        shadow-mapSize={[2048, 2048]}
+        shadow-mapSize={[1024, 1024]}
         shadow-camera-left={-6}
         shadow-camera-right={6}
         shadow-camera-top={6}

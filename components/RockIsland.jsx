@@ -30,12 +30,97 @@ const PEDESTAL_RADIUS = BOARD_HALF_WIDTH * 1.1;
 const Y = -0.315;
 const PEDESTAL_COLOR = '#241F19';
 
+/*
+ * Крок 11, Section C: the model was one flat granite grey (#6E6A62) with
+ * pine silhouettes growing off its sides, per the export's own name
+ * ("granite-pine-aerie"). Inspecting the glTF JSON directly (its `meshes`/
+ * `materials` arrays — no need for a full loader) confirmed there is
+ * exactly one mesh and one material: `meshes[0].primitives` has a single
+ * primitive, `material: 0`, and `materials` has one entry. So this is the
+ * "все одним мешем" case the brief anticipated — a geometry-based mask in
+ * a custom shader, not a second material swap.
+ *
+ * The glTF's own POSITION accessor bounds (min/max, which the spec requires
+ * to stay correct even under Draco compression) gave the raw model's local
+ * extent directly, no runtime raycasting needed this time: X -0.946..0.949,
+ * Y -0.851..0.852, Z -0.813..0.815. ROCK_MIN_Y/ROCK_HEIGHT/ROCK_MAX_RADIUS
+ * below are those bounds — radius taken as the larger of the X/Z half-
+ * extents, since the mask only needs "how far from the vertical axis," not
+ * an exact footprint.
+ */
+const ROCK_MIN_Y = -0.851;
+const ROCK_HEIGHT = 0.852 - ROCK_MIN_Y;
+const ROCK_MAX_RADIUS = 0.949;
+
+// Second accent after the ember (#C1440E, check/capture) — kept dark and
+// muted on purpose so it doesn't compete: not lighter in value than the
+// stone it grows out of. If the eye goes to the foliage before the board,
+// desaturate further rather than brightening the stone to compensate.
+const STONE_TOP = '#7C776C';
+const STONE_DEEP = '#4A4740';
+const FOLIAGE = '#55634E';
+
 const ROCK_MATERIAL = new THREE.MeshStandardMaterial({
   color: '#6E6A62',
   roughness: 0.95,
   metalness: 0,
   flatShading: true,
 });
+
+/*
+ * Vertical stone gradient (STONE_DEEP low -> STONE_TOP high) plus a
+ * geometry-driven foliage mask, injected via onBeforeCompile rather than a
+ * standalone ShaderMaterial — this keeps MeshStandardMaterial's real PBR
+ * lighting (the environment map, the rim light carving out silhouettes,
+ * shadow receiving) and only overrides where the diffuse colour itself
+ * comes from. `vLocalPos` is the raw, pre-scale/offset `position` attribute
+ * (object space), so the radius/height thresholds below are stable
+ * regardless of RockModel's own scale/position transform on the outer group.
+ *
+ * The mask is smoothstepped, not a hard boolean (`radius > 0.7*maxRadius &&
+ * localY > 0.6*height`) — a binary cutoff on flat-shaded, low-poly geometry
+ * reads as a jagged, faceted edge between stone and foliage; the soft band
+ * (0.6..0.8 radius, 0.5..0.65 height) blends across a couple of facets
+ * instead.
+ */
+ROCK_MATERIAL.onBeforeCompile = (shader) => {
+  shader.uniforms.uMinY = { value: ROCK_MIN_Y };
+  shader.uniforms.uHeight = { value: ROCK_HEIGHT };
+  shader.uniforms.uMaxRadius = { value: ROCK_MAX_RADIUS };
+  shader.uniforms.uStoneTop = { value: new THREE.Color(STONE_TOP) };
+  shader.uniforms.uStoneDeep = { value: new THREE.Color(STONE_DEEP) };
+  shader.uniforms.uFoliage = { value: new THREE.Color(FOLIAGE) };
+
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vLocalPos;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLocalPos = position;');
+
+  shader.fragmentShader = shader.fragmentShader
+    .replace(
+      '#include <common>',
+      `#include <common>
+      varying vec3 vLocalPos;
+      uniform float uMinY;
+      uniform float uHeight;
+      uniform float uMaxRadius;
+      uniform vec3 uStoneTop;
+      uniform vec3 uStoneDeep;
+      uniform vec3 uFoliage;`,
+    )
+    .replace(
+      '#include <color_fragment>',
+      `#include <color_fragment>
+      {
+        float heightFrac = clamp((vLocalPos.y - uMinY) / uHeight, 0.0, 1.0);
+        float radius = length(vLocalPos.xz);
+        float edgeRadius = smoothstep(0.6 * uMaxRadius, 0.8 * uMaxRadius, radius);
+        float topHeight = smoothstep(0.5, 0.65, heightFrac);
+        float foliageMask = edgeRadius * topHeight;
+        vec3 stoneColor = mix(uStoneDeep, uStoneTop, heightFrac);
+        diffuseColor.rgb = mix(stoneColor, uFoliage, foliageMask);
+      }`,
+    );
+};
 
 /*
  * Measured, not guessed — a one-time raycast grid (40 radii x 6 angles,

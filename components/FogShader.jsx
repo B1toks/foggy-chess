@@ -4,85 +4,111 @@ import * as THREE from 'three';
 import {
   ALL_SQUARES,
   FOG_ALPHA_KNEE,
+  FOG_BREATH_AMPLITUDE_FAST,
+  FOG_BREATH_AMPLITUDE_SLOW,
+  FOG_BREATH_PERIOD_FAST,
+  FOG_BREATH_PERIOD_SLOW,
   FOG_DEPTH_COLOR_HIGH,
   FOG_DEPTH_COLOR_LOW,
   FOG_DEPTH_COLOR_MID,
-  FOG_DETAIL_OCTAVES,
-  FOG_ENABLE_DETAIL,
   FOG_LAYER_ALPHA_MULT,
   FOG_LAYER_HEIGHTS,
   FOG_LAYERS,
   FOG_MAX_ALPHA,
+  FOG_PARALLAX_STRENGTH,
   FOG_REVEAL_THICKEN_DURATION,
   FOG_TINT_COLOR,
   FOG_WAVE_DELAY_PER_CELL,
   FOG_WAVE_DURATION,
-  FOG_WISP_OCTAVES,
   squareChebyshevDistance,
   squareToMaskIndex,
 } from '../lib/fog';
 import { easeOutCubic } from '../lib/easing';
-import { FBM_GLSL } from '../lib/noise';
+import { getFogNoiseTexture } from './proceduralTextures';
+
+/*
+ * Крок 11, Section A: this file used to mount FOG_LAYERS (5) separate planes,
+ * each its own ShaderMaterial computing three from-scratch noise functions
+ * (fbm + two ridged, five octaves each) per pixel, plus a sixth mesh for the
+ * edge-multiply tint pass — six draw calls, ~15 noise-octave evaluations per
+ * pixel per plane, multiplied again by transparent overdraw where the planes
+ * stack. That is the actual GPU cost the perf pass targets.
+ *
+ * Two structural changes fix it, not tuning:
+ *
+ * - A1: `getFogNoiseTexture()` (proceduralTextures.js) bakes the noise into a
+ *   256x256 RGBA texture once, at module load. fbmTex()/ridgedTex() below
+ *   replace the old five-octave GLSL loops with one texture2D fetch each
+ *   (its four channels ARE four pre-computed octaves), combined with the
+ *   same amplitude falloff the loop used.
+ * - A2: FOG_LAYERS "planes" are now one plane, sliced inside a single
+ *   fragment shader. A raised slice's old real height (which used to buy
+ *   real geometric parallax as the camera orbited) is faked with a UV shift
+ *   along the camera's own view direction — `sliceGLSL()` unrolls one block
+ *   per slice, JS-templated the same way `ridgedGLSL` used to be, so
+ *   FOG_LAYERS/FOG_LAYER_HEIGHTS/FOG_LAYER_ALPHA_MULT still drive it and
+ *   dropping FOG_LAYERS 5->2 doesn't leave orphaned config. Each slice is
+ *   composited into `accum` with the exact src-over recurrence
+ *   (`rgb*a + accum.rgb*(1-a)`, `a + accum.a*(1-a)`) that stacking N real
+ *   transparent draws would have produced — same math, one draw call.
+ *   The old edge-multiply mesh is folded into slice 0's own color instead of
+ *   surviving as a second MultiplyBlending draw — an approximation (a direct
+ *   tint mix on the fog's own color, not a true multiply of the framebuffer
+ *   beneath it), acceptable because it was already demoted to "a little
+ *   extra depth at the frontier," never the readability mechanism.
+ *
+ * `ownVisible`/`edge`'s safety property is unchanged: both still key off the
+ * true, texel-snapped `vUv` (never the parallax-shifted sample), so a
+ * visible square reads with density 0 on every slice regardless of how much
+ * a raised slice's noise field has been shifted around it — the same
+ * decoupling Крок 10 Section B's fix relied on.
+ */
 
 const VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
+  varying vec3 vWorldPos;
 
   void main() {
     vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vWorldPos = worldPos.xyz;
+    gl_Position = projectionMatrix * viewMatrix * worldPos;
   }
 `;
 
 /*
- * Ridged noise: same value-noise lattice as fbm (from FBM_GLSL, already
- * included above this), but each octave is folded around its midpoint
- * (`1.0 - abs(n*2.0-1.0)`) and squared. Where plain fbm gives soft blobs,
- * folding turns every octave's zero-crossings into a sharp ridge — the result
- * reads as fibrous wisps and gaps rather than clouds.
- *
- * Octave count is baked into the function name/loop bound at shader-source
- * build time, not passed as a uniform: GLSL loop bounds are simplest and
- * most portable as compile-time constants, and this is a perf knob a
- * developer dials (lib/fog.js), never something a player or a URL touches.
- */
-function ridgedGLSL(name, octaves) {
-  return /* glsl */ `
-    float ${name}(vec2 p) {
-      float v = 0.0;
-      float a = 0.5;
-      for (int i = 0; i < ${octaves}; i++) {
-        float n = valueNoise(p);
-        n = 1.0 - abs(n * 2.0 - 1.0);
-        n *= n;
-        v += a * n;
-        p *= 2.07;
-        a *= 0.5;
-      }
-      return v;
-    }
-  `;
-}
-
-/*
- * Shared by every layer's fragment shader (and the edge-multiply pass): the
- * uniforms and noise functions don't vary, so this exists as one piece of
- * text instead of several copies that could quietly drift apart.
+ * A1: fbmTex/ridgedTex stand in for lib/noise.js's GLSL fbm() and the old
+ * ridgedGLSL() loop. uNoiseTex's four channels are four independently-
+ * seamless octaves at doubling frequency (see getFogNoiseTexture) — one
+ * texture2D fetch returns all four, so a 4-octave sum costs one hardware-
+ * filtered sample instead of four-to-five loop iterations of hash() calls.
  */
 function sharedUniformsAndNoiseGLSL() {
   return /* glsl */ `
     uniform sampler2D uMask;
+    uniform sampler2D uNoiseTex;
     uniform float uTime;
-    uniform float uOpacity;
-    uniform float uScale;
-    uniform float uDriftScale;
-    uniform float uDriftAngle;
-    uniform vec2 uUvOffset;
-    uniform float uEdgeGain;
     varying vec2 vUv;
+    varying vec3 vWorldPos;
 
-    ${FBM_GLSL}
-    ${ridgedGLSL('ridgedWisp', FOG_WISP_OCTAVES)}
-    ${FOG_ENABLE_DETAIL ? ridgedGLSL('ridgedDetail', FOG_DETAIL_OCTAVES) : ''}
+    vec4 noise4(vec2 p) {
+      return texture2D(uNoiseTex, p);
+    }
+
+    float fbmTex(vec2 p) {
+      vec4 n = noise4(p);
+      return n.r * 0.5 + n.g * 0.25 + n.b * 0.125 + n.a * 0.0625;
+    }
+
+    float ridgeFold(float n) {
+      float r = 1.0 - abs(n * 2.0 - 1.0);
+      return r * r;
+    }
+
+    float ridgedTex(vec2 p) {
+      vec4 n = noise4(p);
+      return ridgeFold(n.r) * 0.5 + ridgeFold(n.g) * 0.25 + ridgeFold(n.b) * 0.125 + ridgeFold(n.a) * 0.0625;
+    }
 
     vec2 rotate(vec2 v, float a) {
       float c = cos(a);
@@ -93,272 +119,83 @@ function sharedUniformsAndNoiseGLSL() {
 }
 
 /*
- * Also shared: everything from sampling the mask through to `density` (how
- * fogged this pixel is, boundary-boosted) and `shaped` (the wisp pattern's
- * own coverage, 0..1).
- *
- * Крок 10, Section B additions over the Крок 9.5 version: `uUvOffset` shifts
- * this layer's whole noise field by an amount the caller sets proportional
- * to the layer's own height ("UV-зсув пропорційний висоті" in the brief) —
- * real geometric parallax between layers already falls out for free from
- * them being actual planes at different Y as the camera orbits; this offset
- * is what keeps five layers from ever sampling the *identical* pattern
- * directly on top of each other, which would silhouette as one layer, not
- * five. `uDriftAngle` rotates the three drift vectors (not the static
- * sampling grid — that would fight the deliberately anisotropic "stretched"
- * sampling below and turn horizontal streaks into a rotated mess) so each
- * layer's wisps drift in their own direction, not just at their own speed.
+ * One slice's contribution, JS-templated per index so every constant below
+ * is a GLSL literal (no uniform-array indexing, no runtime branching) —
+ * matches how ridgedGLSL/layerFragmentShaderSource baked FOG_ALPHA_KNEE etc.
+ * as literals before this pass. Shares `ownVisible`, `edge`'s inputs
+ * (cellUv/revealPulse), `parallaxDir` and `breathShift`, computed once in
+ * main() below, across every slice.
  */
-function densityAndShapeGLSL() {
+function sliceGLSL(index, params) {
+  const { height, scale, driftScale, driftAngle, uvOffset, edgeGain, surfaceStart, surfaceEnd, alphaMult } =
+    params;
+  const surface =
+    surfaceEnd > surfaceStart
+      ? `smoothstep(${surfaceStart.toFixed(4)}, ${surfaceEnd.toFixed(4)}, density)`
+      : `step(${surfaceStart.toFixed(4)}, density)`;
+
   return /* glsl */ `
-    vec2 sampleUv = vUv + uUvOffset;
+  {
+    // slice ${index}, virtual height ${height}
+    vec2 parallax = parallaxDir * ${height.toFixed(4)} * ${FOG_PARALLAX_STRENGTH.toFixed(4)};
+    vec2 sampleUv = vUv + parallax + vec2(${uvOffset[0].toFixed(4)}, ${uvOffset[1].toFixed(4)});
 
-    // Крок 10, Section B fix: sampling the mask at the live, freely-varying
-    // vUv through a LinearFilter texture blends in neighbouring texels
-    // whenever a fragment lands anywhere near a texel boundary — which is
-    // most of a boundary square's own area, not just its edge pixels. At
-    // the old, gentler alpha ceiling that bleed was invisible; at
-    // FOG_MAX_ALPHA=0.94 it was enough on its own to wash a fully *visible*
-    // boundary square down by 80+ luma, failing "visible squares stay
-    // absolutely clean" outright. Snapping to the containing texel's exact
-    // centre before sampling reads that texel undiluted — bilinear weights
-    // are exactly (1,0,0,0) at a texel centre — so ownVisible is the true
-    // discrete 0/1 state of *this* square, never a neighbour's blend.
-    vec2 cellUv = (floor(vUv * 8.0) + 0.5) / 8.0;
-    vec2 ownMask = texture2D(uMask, cellUv).rg;
-    // R: this square's current wave-eased visibility (0 fogged .. 1 clear),
-    // already shaped into an outward-travelling wave on the CPU side (see
-    // FogShader's useFrame) rather than a flat lerp — so the existing
-    // density/alpha math below reproduces the wave for free, no shader-side
-    // timing needed for the core open/close mechanic.
-    float ownVisible = ownMask.r;
-    // G: the wall-clock moment this square's reveal wave was scheduled to
-    // start (Крок 10, Section C — "час, коли клітинка стала видимою"). Used
-    // only for a bounded, decaying turbulence pulse right as the wave front
-    // passes through — the reveal should read as fog getting blown apart,
-    // not a plain crossfade. -999.0 (never revealed) decays to a permanent
-    // zero pulse rather than a spurious spike.
-    float revealAge = uTime - ownMask.g;
-    float revealPulse = ownMask.g > -500.0 ? exp(-abs(revealAge) * 3.0) : 0.0;
+    vec2 driftMass   = rotate(vec2( 0.015, -0.009), ${driftAngle.toFixed(4)}) * uTime * ${driftScale.toFixed(4)};
+    vec2 driftWisps  = rotate(vec2(-0.021,  0.017), ${driftAngle.toFixed(4)}) * uTime * ${driftScale.toFixed(4)};
+    vec2 driftDetail = rotate(vec2( 0.034,  0.026), ${driftAngle.toFixed(4)}) * uTime * ${driftScale.toFixed(4)};
 
-    // Three non-parallel, non-proportional drift vectors — not one vector
-    // scaled and negated — so the wisp structure keeps reconfiguring as it
-    // moves instead of just translating as a rigid pattern. Rotated per
-    // layer by uDriftAngle so each layer also drifts its own direction.
-    vec2 driftMass   = rotate(vec2( 0.015, -0.009), uDriftAngle) * uTime * uDriftScale;
-    vec2 driftWisps  = rotate(vec2(-0.021,  0.017), uDriftAngle) * uTime * uDriftScale;
-    vec2 driftDetail = rotate(vec2( 0.034,  0.026), uDriftAngle) * uTime * uDriftScale;
-
-    // Compressing the sample point's V by 3.2x before feeding it to the
-    // ridged layers means the noise argument changes fast along V (rank,
-    // "into the board") and slow along U (file, "across the board") — so
-    // the ridges it produces read as long streaks along U: horizontal
-    // wisps, not an isotropic speckle.
     vec2 stretched = vec2(sampleUv.x, sampleUv.y * 3.2);
 
-    // Large, slow: the general mass of haze — this is what the old single
-    // fbm() call used to be on its own.
-    float mass = fbm(sampleUv * 3.0 * uScale + driftMass);
-    // Medium, ridged: the wisps themselves.
-    float wisps = ridgedWisp(stretched * 4.0 * uScale + driftWisps);
-    // Small, ridged, faint: frays the edges of the wisps rather than adding
-    // its own visible shapes — note the double attenuation (0.35 here, more
-    // wherever shaped is used below), deliberately faint.
-    float detail = ${FOG_ENABLE_DETAIL ? "ridgedDetail(stretched * 11.0 * uScale + driftDetail) * 0.35" : "0.0"};
+    float mass   = fbmTex(sampleUv * 3.0 * ${scale.toFixed(4)} + driftMass);
+    float wisps  = ridgedTex(stretched * 4.0 * ${scale.toFixed(4)} + driftWisps);
+    float detail = ridgedTex(stretched * 11.0 * ${scale.toFixed(4)} + driftDetail) * 0.35;
 
-    // revealPulse briefly boosts the wisp scale right as this square's wave
-    // starts moving — a short-lived flourish on top of the wave's own alpha
-    // motion, not a second source of readability (it never touches ownVisible
-    // or the base density term below).
     float clouds = mass * 0.5 + wisps * (0.4 + revealPulse * 0.3) + detail * 0.25;
-
-    // A wisp along the frontier. The mask gradient peaks exactly where
-    // visible meets fogged, so it thickens the boundary and keeps it from
-    // reading as a plain translucent rectangle.
-    //
-    // Крок 10, Section D: the boundary should "boil" rather than trace a flat
-    // line. Warping where the gradient samples land by detail (the finest,
-    // fastest-drifting of the three noise scales already computed above)
-    // gets that for free — no fourth noise evaluation, and the wobble
-    // inherits detail's own time-drift automatically instead of needing a
-    // separate clock term.
-    vec2 texel = vec2(1.0 / 8.0);
-    vec2 boil = vec2(detail, wisps - mass) * 0.035;
-    float gx = texture2D(uMask, vUv + vec2(texel.x, 0.0) + boil).r
-             - texture2D(uMask, vUv - vec2(texel.x, 0.0) + boil).r;
-    float gy = texture2D(uMask, vUv + vec2(0.0, texel.y) + boil).r
-             - texture2D(uMask, vUv - vec2(0.0, texel.y) + boil).r;
-    // Gated by (1 - ownVisible): the gradient is nonzero on *both* sides of
-    // a boundary (a visible texel next to a fogged one has just as steep a
-    // gradient as the fogged texel itself), but the frontier-thickening
-    // effect is only wanted on the fogged side. Without this gate a visible
-    // boundary square picked up real density from its fogged neighbour's
-    // edge alone — the second half of the same bleed cellUv above fixes
-    // for the mask's base term.
-    float edge = clamp(length(vec2(gx, gy)) * 1.8, 0.0, 1.0) * (1.0 - ownVisible);
-
     float shaped = smoothstep(0.28, 0.78, clouds);
 
-    // Steeper than linear so the fog stays opaque in the deep and gives way
-    // quickly near the frontier, plus the edge boost so the boundary itself
-    // stays dense rather than reading as a flat translucent rectangle. Exactly
-    // zero on a visible square: ownVisible=1 zeroes the first term, and the
-    // (1 - ownVisible) gate above zeroes edge too — both independently, so a
-    // visible square stays clean regardless of camera angle, how many layers
-    // are stacked overhead, or how steep its neighbour's own gradient is.
-    float density = pow(1.0 - ownVisible, 1.35) + edge * uEdgeGain;
-  `;
-}
+    vec2 texel = vec2(1.0 / 8.0);
+    vec2 boil = vec2(detail, wisps - mass) * 0.035;
+    // Крок 11, Section D: sampled at breathedUv (vUv + the breathing offset),
+    // not plain vUv — see main()'s own comment for why breathing has to move
+    // *where* the boundary is tested, not nudge density after the fact.
+    float gx = texture2D(uMask, breathedUv + vec2(texel.x, 0.0) + boil).r
+             - texture2D(uMask, breathedUv - vec2(texel.x, 0.0) + boil).r;
+    float gy = texture2D(uMask, breathedUv + vec2(0.0, texel.y) + boil).r
+             - texture2D(uMask, breathedUv - vec2(0.0, texel.y) + boil).r;
+    float edge = clamp(length(vec2(gx, gy)) * 1.8, 0.0, 1.0) * (1.0 - ownVisible);
 
-/*
- * Крок 10, Section A — the readability rebuild. Alpha, not multiply, is the
- * primary mechanism again: THREE.MultiplyBlending (Крок 9.5) could only ever
- * scale the framebuffer, never truly hide it, so even "readable" deep fog
- * still let a careful look tell a light tile from a dark one. Plain alpha
- * reaching FOG_MAX_ALPHA (0.94) in the deep field means whatever's
- * underneath contributes at most 6% of the final pixel — provably below the
- * "< 6 luma difference" verification bar, not just tuned to look right.
- *
- * `uOpacity` here is each layer's own alpha multiplier (1.0 for the base
- * layer, falling off fast for the raised ones — see FOG_LAYER_ALPHA_MULT),
- * not a single global knob anymore.
- *
- * `uSurfaceStart`/`uSurfaceEnd` — Section B's "top surface": an extra
- * smoothstep gate on `density` so a raised layer only appears where the fog
- * beneath it is *already* substantially deep, tapering to nothing at the
- * frontier. The base layer's gate is [0, 0] (smoothstep degenerates to "on"
- * for any density > 0), so it alone still reproduces Section A's curve
- * exactly, unrestricted — raised layers are silhouette riding on top of it,
- * never a second source of readability.
- *
- * `uColorMid` and `colorVariance` fix a bug the brief's own verification
- * step caught: mixing the full uColorLow-uColorHigh range (a ~37-luma
- * spread) at every density meant two *adjacent* deep-fog pixels could land
- * on different points of that range purely from noise phase, independent of
- * which tile was underneath — measured, this alone produced a bigger luma
- * delta between two deep-fogged neighbours than the "< 6" bar allows, before
- * the underlying tile ever entered into it. The brief's own colour range is
- * for the frontier ("на межі — м'який градієнт, це те, що розповідає
- * історію"); the deep interior is supposed to be "глухо" — muffled, uniform,
- * not textured — so `colorVariance` fades the noise mix out as density rises
- * past the alpha knee, converging on a single flat `uColorMid` deep in the
- * field instead of continuing to swing across the full range.
- */
-function layerFragmentShaderSource() {
-  return /* glsl */ `
-    ${sharedUniformsAndNoiseGLSL()}
-    uniform vec3 uColorLow;
-    uniform vec3 uColorHigh;
-    uniform vec3 uColorMid;
-    uniform float uSurfaceStart;
-    uniform float uSurfaceEnd;
+    float density = pow(1.0 - ownVisible, 1.35) + edge * ${edgeGain.toFixed(4)};
 
-    void main() {
-      ${densityAndShapeGLSL()}
+    float surface = ${surface};
+    float alpha = smoothstep(0.0, ${FOG_ALPHA_KNEE.toFixed(3)}, density)
+      * ${FOG_MAX_ALPHA.toFixed(3)} * ${alphaMult.toFixed(4)} * surface;
 
-      float surface = uSurfaceEnd > uSurfaceStart
-        ? smoothstep(uSurfaceStart, uSurfaceEnd, density)
-        : step(uSurfaceStart, density);
-      float alpha = smoothstep(0.0, ${FOG_ALPHA_KNEE.toFixed(3)}, density)
-        * ${FOG_MAX_ALPHA.toFixed(3)} * uOpacity * surface;
-      if (alpha < 0.002) discard;
-
+    if (alpha > 0.002) {
       vec3 noisyColor = mix(uColorLow, uColorHigh, shaped);
       float colorVariance = 1.0 - smoothstep(${FOG_ALPHA_KNEE.toFixed(3)}, 1.0, density);
       vec3 color = mix(uColorMid, noisyColor, colorVariance);
-      gl_FragColor = vec4(color, alpha);
+      ${
+        index === 0
+          ? `
+      // Крок 10's edge-multiply pass, folded into slice 0 instead of a
+      // second MultiplyBlending draw call — see file header comment.
+      float tintBand = smoothstep(0.15, 0.3, density) * (1.0 - smoothstep(0.35, 0.5, density));
+      color = mix(color, uTint, tintBand * 0.5);
+      `
+          : ''
+      }
+      accum.rgb = color * alpha + accum.rgb * (1.0 - alpha);
+      accum.a = alpha + accum.a * (1.0 - alpha);
     }
+  }
   `;
-}
-
-/*
- * The one surviving multiply pass, demoted from "the mechanism" (Крок 9.5)
- * to "a little extra depth right at the frontier" (Крок 10). Windowed to
- * density 0.15-0.5 so it touches neither the fully clear zone (nothing to
- * darken) nor the deep interior (already opaque — multiplying an already-
- * 94%-covered pixel toward a tint is imperceptible and not worth the ALU).
- * Mounted once, on the base layer only — raised layers are silhouette and
- * don't need their own edge treatment.
- */
-function edgeMultiplyFragmentShaderSource() {
-  return /* glsl */ `
-    ${sharedUniformsAndNoiseGLSL()}
-    uniform vec3 uTint;
-
-    void main() {
-      ${densityAndShapeGLSL()}
-
-      float band = smoothstep(0.15, 0.3, density) * (1.0 - smoothstep(0.35, 0.5, density));
-      if (band < 0.002) discard;
-
-      vec3 base = mix(vec3(1.0), uTint, band * 0.5);
-      gl_FragColor = vec4(base, 1.0);
-    }
-  `;
-}
-
-function makeLayerMaterial(mask, params) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uMask: { value: mask },
-      uTime: { value: 0 },
-      uOpacity: { value: params.alphaMult },
-      uScale: { value: params.scale },
-      uDriftScale: { value: params.driftScale },
-      uDriftAngle: { value: params.driftAngle },
-      uUvOffset: { value: new THREE.Vector2(params.uvOffset[0], params.uvOffset[1]) },
-      uEdgeGain: { value: params.edgeGain },
-      uColorLow: { value: new THREE.Color(FOG_DEPTH_COLOR_LOW) },
-      uColorHigh: { value: new THREE.Color(FOG_DEPTH_COLOR_HIGH) },
-      uColorMid: { value: new THREE.Color(FOG_DEPTH_COLOR_MID) },
-      uSurfaceStart: { value: params.surfaceStart },
-      uSurfaceEnd: { value: params.surfaceEnd },
-    },
-    vertexShader: VERTEX_SHADER,
-    fragmentShader: layerFragmentShaderSource(),
-    transparent: true,
-    depthWrite: false,
-  });
-}
-
-function makeEdgeMultiplyMaterial(mask, params) {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uMask: { value: mask },
-      uTime: { value: 0 },
-      uOpacity: { value: 1 },
-      uScale: { value: params.scale },
-      uDriftScale: { value: params.driftScale },
-      uDriftAngle: { value: params.driftAngle },
-      uUvOffset: { value: new THREE.Vector2(0, 0) },
-      uEdgeGain: { value: params.edgeGain },
-      uTint: { value: new THREE.Color(FOG_TINT_COLOR) },
-    },
-    vertexShader: VERTEX_SHADER,
-    fragmentShader: edgeMultiplyFragmentShaderSource(),
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.MultiplyBlending,
-  });
 }
 
 /*
  * Крок 10, Section B: per-layer tuning, derived from index rather than
- * hand-picked per layer, so FOG_LAYERS can drop from 5 to 2 (the perf
- * ladder's first lever) without leaving orphaned config behind.
- *
- * - scale grows with height ("масштаб шуму зростає з висотою"): higher
- *   layers get finer-grained noise.
- * - driftAngle spreads layers around a circle so no two drift the same way;
- *   driftScale alternates sign and grows slightly so speed differs too.
- * - uvOffset is proportional to height, in a fixed (non-height-dependent)
- *   direction — see densityAndShapeGLSL's own comment for why this exists
- *   alongside the real geometric parallax the height difference already
- *   gives for free.
- * - surfaceStart/End step up with height: the base layer (index 0) is
- *   unrestricted ([0, 0]), each layer above needs progressively deeper fog
- *   beneath it before it shows at all, tapering the whole stack's silhouette
- *   to nothing at the frontier instead of a hard-edged wall of planes.
+ * hand-picked, so FOG_LAYERS can drop from 5 to 2 without leaving orphaned
+ * config behind. Unchanged from the pre-Крок-11 version other than living
+ * here instead of feeding a separate material per layer.
  */
 function layerParams(index, height) {
   const driftSign = index % 2 === 0 ? 1 : -1;
@@ -375,6 +212,110 @@ function layerParams(index, height) {
   };
 }
 
+function fragmentShaderSource() {
+  const slices = FOG_LAYER_HEIGHTS.slice(0, FOG_LAYERS)
+    .map((height, i) => sliceGLSL(i, layerParams(i, height)))
+    .join('\n');
+
+  return /* glsl */ `
+    ${sharedUniformsAndNoiseGLSL()}
+    uniform vec3 uColorLow;
+    uniform vec3 uColorHigh;
+    uniform vec3 uColorMid;
+    uniform vec3 uTint;
+
+    void main() {
+      // Unshifted read first, purely for this square's own timing state
+      // (reveal pulse, wave-suppression clock below) — its identity must
+      // stay tied to the true cell regardless of any breathing offset
+      // applied later. Same texel-centre snap as before (see Крок 10
+      // Section B): reads the texel undiluted, no neighbour blend.
+      vec2 cellUv0 = (floor(vUv * 8.0) + 0.5) / 8.0;
+      vec4 ownMask0 = texture2D(uMask, cellUv0);
+      float revealAge = uTime - ownMask0.g;
+      float revealPulse = ownMask0.g > -500.0 ? exp(-abs(revealAge) * 3.0) : 0.0;
+
+      // Крок 11, Section D: breathing must not fight an in-flight
+      // reveal/conceal wave (Крок 10 Section C). ownMask0.b carries the
+      // wall-clock moment THIS square's current wave (either direction)
+      // started — see FogShader's useFrame below. Amplitude is gated to 0
+      // right as a wave starts and eases back in over the wave's own
+      // duration, so the two motions never read as one blurred mess.
+      float waveAge = uTime - ownMask0.b;
+      float breathAmpMult = smoothstep(0.0, ${FOG_WAVE_DURATION.toFixed(3)}, waveAge);
+
+      float breath1 = sin(uTime * ${FOG_BREATH_PERIOD_SLOW.toFixed(4)}) * 0.5 + 0.5;
+      float edgeShift1 = mix(-${FOG_BREATH_AMPLITUDE_SLOW.toFixed(4)}, ${FOG_BREATH_AMPLITUDE_SLOW.toFixed(4)}, breath1);
+      // Phase offset by vUv so the fast ripple doesn't pulse in lockstep
+      // across the whole board — it travels as ripples, not a strobe.
+      float breath2 = sin(uTime * ${FOG_BREATH_PERIOD_FAST.toFixed(4)} + dot(vUv, vec2(13.0, 7.0))) * 0.5 + 0.5;
+      float edgeShift2 = mix(-${FOG_BREATH_AMPLITUDE_FAST.toFixed(4)}, ${FOG_BREATH_AMPLITUDE_FAST.toFixed(4)}, breath2);
+      // Combined shift, in fractions of a board cell (matches the brief's
+      // own units) — how far the boundary itself gets nudged this frame.
+      float breathShift = (edgeShift1 + edgeShift2) * breathAmpMult;
+
+      /*
+       * Крок 11, Section D -- why this has to move a position, not nudge
+       * density: verified empirically (a headless Playwright session
+       * forcing uTime 500 units apart and reading back raw pixels via
+       * gl.readPixels) that a settled, non-transitioning fogged cell has
+       * ownVisible pinned at exactly 0.0 (only mid-wave does it take
+       * intermediate values), which puts density at exactly 1.0+ -- already
+       * saturating both smoothstep(0, FOG_ALPHA_KNEE, density) for alpha
+       * and smoothstep(FOG_ALPHA_KNEE, 1.0, density) for colour variance.
+       * Adding a small breathShift on top of an already-saturated density
+       * changes nothing at all -- confirmed byte-identical pixels across the
+       * jump. There is no continuous 0..1 spatial ramp to nudge in this
+       * density model outside of an active wave; the soft edge the mask
+       * itself describes is the wave's own temporal crossfade, not a
+       * standing spatial gradient.
+       *
+       * So breathing instead shifts where the boundary is tested: vUv is
+       * offset by up to a few percent of a cell before sampling uMask for
+       * ownVisible / the edge gradient below. Only pixels already within
+       * about that same distance of a true mask boundary can have their
+       * ownVisible read flip as a result -- a cell's own centre needs a
+       * shift larger than half its width to ever reach a different texel,
+       * far more than breathShift ever produces, so "density at cell centres
+       * stays exactly as the mask says" holds by construction, not by
+       * coincidence.
+       */
+      vec2 breathedUv = vUv + vec2(breathShift) * (1.0 / 8.0);
+      vec2 cellUv = (floor(breathedUv * 8.0) + 0.5) / 8.0;
+      float ownVisible = texture2D(uMask, cellUv).r;
+
+      vec3 viewDir = normalize(cameraPosition - vWorldPos);
+      vec2 vd = viewDir.xz;
+      float vdLen = length(vd);
+      vec2 parallaxDir = vdLen > 0.0001 ? vd / vdLen : vec2(0.0);
+
+      vec4 accum = vec4(0.0);
+      ${slices}
+
+      if (accum.a < 0.002) discard;
+      gl_FragColor = vec4(accum.rgb, accum.a);
+    }
+  `;
+}
+
+function makeFogMaterial(mask, noiseTex) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uMask: { value: mask },
+      uNoiseTex: { value: noiseTex },
+      uTime: { value: 0 },
+      uColorLow: { value: new THREE.Color(FOG_DEPTH_COLOR_LOW) },
+      uColorHigh: { value: new THREE.Color(FOG_DEPTH_COLOR_HIGH) },
+      uColorMid: { value: new THREE.Color(FOG_DEPTH_COLOR_MID) },
+      uTint: { value: new THREE.Color(FOG_TINT_COLOR) },
+    },
+    vertexShader: VERTEX_SHADER,
+    fragmentShader: fragmentShaderSource(),
+    transparent: true,
+    depthWrite: false,
+  });
+}
+
 /*
  * Крок 10, Section C: state that drives the per-square wave instead of a flat
  * exponential lerp. Indexed by mask index (squareToMaskIndex), not board
@@ -388,10 +329,13 @@ function layerParams(index, height) {
  * - `oldValue`/`newValue` are the two ends of the current wave for that
  *   square; `startTime` is when (on the local clock) that square's wave is
  *   scheduled to begin, already carrying its distance-from-origin stagger
- *   and, for a dramatic enemy reveal, the extra thicken hold.
+ *   and, for a dramatic enemy reveal, the extra thicken hold. Крок 11
+ *   reuses this same array as the mask's B channel — "when did this
+ *   square's current wave, either direction, start" is exactly what
+ *   Section D's breathing suppression needs, so no second array was added.
  * - `revealTime` mirrors `startTime` but only for reveals (isVisible target
  *   1), and survives past the wave's own completion — it's what the shader's
- *   G-channel turbulence pulse reads (see densityAndShapeGLSL).
+ *   G-channel turbulence pulse reads (see fragmentShaderSource above).
  */
 function useWaveState() {
   return useRef({
@@ -408,47 +352,46 @@ function useWaveState() {
 export default function FogShader({ visibility, lastMove = null, enemyPieceSquares = null }) {
   const wave = useWaveState();
 
-  const { mask, layers, edgeMultiply } = useMemo(() => {
-    const data = new Float32Array(64 * 2); // [r, g] per texel: r = eased visibility, g = reveal time
-    data.fill(-999);
-    for (let i = 0; i < 64; i++) data[i * 2] = 0; // start fully fogged
-    const texture = new THREE.DataTexture(data, 8, 8, THREE.RGFormat, THREE.FloatType);
+  const { mask, material } = useMemo(() => {
+    // RGBA now, not RG: A (r=eased visibility, g=reveal time) plus
+    // (Крок 11) b = this square's current wave start time, for the
+    // breathing-suppression gate. A channel is unused, kept at 0.
+    const data = new Float32Array(64 * 4);
+    for (let i = 0; i < 64; i++) {
+      data[i * 4] = 0; // start fully fogged
+      data[i * 4 + 1] = -999; // revealTime
+      data[i * 4 + 2] = 0; // lastChangeStart
+      data[i * 4 + 3] = 0;
+    }
+    const texture = new THREE.DataTexture(data, 8, 8, THREE.RGBAFormat, THREE.FloatType);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
     texture.wrapS = THREE.ClampToEdgeWrapping;
     texture.wrapT = THREE.ClampToEdgeWrapping;
     texture.needsUpdate = true;
 
-    const builtLayers = FOG_LAYER_HEIGHTS.slice(0, FOG_LAYERS).map((height, i) => {
-      const params = layerParams(i, height);
-      return { height, material: makeLayerMaterial(texture, params) };
-    });
+    const noiseTex = getFogNoiseTexture();
 
-    return {
-      mask: texture,
-      layers: builtLayers,
-      // Mounted against the base layer's own params (index 0) so its noise
-      // sampling lines up with what it's adding depth on top of.
-      edgeMultiply: makeEdgeMultiplyMaterial(texture, layerParams(0, FOG_LAYER_HEIGHTS[0])),
-    };
+    return { mask: texture, material: makeFogMaterial(texture, noiseTex) };
   }, []);
 
   useEffect(
     () => () => {
-      layers.forEach((l) => l.material.dispose());
-      edgeMultiply.dispose();
+      material.dispose();
       mask.dispose();
+      // getFogNoiseTexture() is a shared module-level singleton (like
+      // getBoardRoughnessMap) — not disposed per-mount.
     },
-    [layers, edgeMultiply, mask],
+    [material, mask],
   );
 
   // QA hook, gated the same way HUD's ?debug=1 readout is: lets a script
   // inspect the live mask/uniform state instead of guessing from pixels.
   useEffect(() => {
     if (typeof window === 'undefined' || !window.location.search.includes('debug')) return;
-    window.__fogMaterials = { layers, edgeMultiply, mask };
+    window.__fogMaterials = { material, mask };
     window.__fogWave = wave;
-  }, [layers, edgeMultiply, mask, wave]);
+  }, [material, mask, wave]);
 
   /*
    * Schedules a new wave whenever the *content* of `visibility` actually
@@ -521,38 +464,19 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
       const eased = easeOutCubic(t);
       const value = w.oldValue[i] + (w.newValue[i] - w.oldValue[i]) * eased;
       w.effective[i] = value;
-      data[i * 2] = value;
-      data[i * 2 + 1] = w.revealTime[i];
+      data[i * 4] = value;
+      data[i * 4 + 1] = w.revealTime[i];
+      data[i * 4 + 2] = w.startTime[i];
     }
     mask.needsUpdate = true;
 
-    layers.forEach((l) => {
-      l.material.uniforms.uTime.value = now;
-    });
-    edgeMultiply.uniforms.uTime.value = now;
+    material.uniforms.uTime.value = now;
   });
 
   return (
-    <group>
-      {layers.map((l, i) => (
-        <mesh
-          key={i}
-          position={[0, l.height, 0]}
-          rotation={[-Math.PI / 2, 0, 0]}
-          renderOrder={2 + i}
-        >
-          <planeGeometry args={[8, 8]} />
-          <primitive object={l.material} attach="material" />
-        </mesh>
-      ))}
-      {/* Same height as the base layer, but drawn last (highest renderOrder)
-          so its multiply darkens whatever the whole layer stack has already
-          composited in the transition band, base included — a subtle final
-          pass, not a step wedged between two alpha layers. */}
-      <mesh position={[0, FOG_LAYER_HEIGHTS[0], 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2 + FOG_LAYERS}>
-        <planeGeometry args={[8, 8]} />
-        <primitive object={edgeMultiply} attach="material" />
-      </mesh>
-    </group>
+    <mesh position={[0, FOG_LAYER_HEIGHTS[0], 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={3}>
+      <planeGeometry args={[8, 8]} />
+      <primitive object={material} attach="material" />
+    </mesh>
   );
 }
