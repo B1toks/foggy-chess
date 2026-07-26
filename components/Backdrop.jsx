@@ -59,8 +59,10 @@ export const BACKDROP_IMAGE = '/textures/mountains.jpg';
  *   TOP_Y = y_skyline + 0.20 * HEIGHT
  */
 const IMAGE_ASPECT = 2560 / 1429;
-// Exported so Plateau.jsx's ground extension can reach exactly this far
-// without a second, driftable copy of the number — see "Крок 8" Section A.
+// Exported for anything else that needs to reason about the segment's own
+// radius without a second, driftable copy of the number (Крок 8/9's ground
+// extension used to be that caller; it's gone as of Крок 9.6, Section C —
+// see RockIsland.jsx).
 export const RADIUS = 46;
 /*
  * 200, not the ~150 that first framed well. The camera subtends up to ~50deg of

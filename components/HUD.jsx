@@ -40,7 +40,7 @@ function SoundToggle() {
     <button
       onClick={() => setOn(setAudioEnabled(!on))}
       aria-pressed={on}
-      title={on ? 'Вимкнути звук' : 'Увімкнути звук'}
+      title={on ? 'Mute sound' : 'Unmute sound'}
       style={{
         ...CORNER_BUTTON_STYLE,
         color: on ? 'var(--ember)' : 'var(--muted)',
@@ -61,7 +61,7 @@ function NewGameButton({ onNewGame, prominent }) {
   return (
     <button
       onClick={onNewGame}
-      title="Нова гра"
+      title="New game"
       style={{
         ...CORNER_BUTTON_STYLE,
         color: prominent ? 'var(--ember)' : 'var(--muted)',
@@ -104,7 +104,7 @@ function ControlHint() {
         whiteSpace: 'nowrap',
       }}
     >
-      Перетягніть, щоб обертати · Колесо — масштаб
+      Drag to orbit · Scroll to zoom
     </div>
   );
 }
@@ -219,8 +219,8 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
             )}
           </div>
 
-          {status === 'check' && <StatusFlash text="Шах" />}
-          {status === 'checkmate' && <StatusFlash text="Мат" />}
+          {status === 'check' && <StatusFlash text="Check" />}
+          {status === 'checkmate' && <StatusFlash text="Checkmate" />}
         </>
       )}
     </>

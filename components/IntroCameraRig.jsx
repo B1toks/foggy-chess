@@ -35,10 +35,12 @@ const KNIGHT_SQUARE = [2.5, 3.5];
 export const FRAMES = [
   {
     // "Крізь туман" — low, near-level, pushing forward over the board with
-    // the mountains on the horizon. This is the shot that needed Section A's
-    // ground extension: at this height and pitch the camera looks almost
-    // straight across the plateau, which used to be a bare gap this close to
-    // the horizon.
+    // the mountains on the horizon. This position sits outside the small
+    // rock the board now stands on (Крок 9.6, Section C replaced the old
+    // continuous ground plateau this shot originally needed) — currently
+    // untested against that change; revisit if this shot reads as floating
+    // in open void rather than pushing low across a landscape once the real
+    // rock model (or its temporary pedestal) is checked from this angle.
     from: { position: [0, 0.62, -7.3], target: [0, 0.42, 6] },
     to: { position: [0, 0.52, -5.3], target: [0, 0.38, 6] },
     duration: 5,

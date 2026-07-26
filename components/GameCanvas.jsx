@@ -11,7 +11,7 @@ import Pieces from './Pieces';
 import Fog from './Fog';
 import Lighting from './Lighting';
 import Backdrop, { BACKDROP_FOG } from './Backdrop';
-import Plateau, { SHOW_PLATEAU } from './Plateau';
+import RockIsland, { SHOW_ROCK_ISLAND } from './RockIsland';
 import { playMoveSound } from './audio';
 import HUD from './HUD';
 import IntroOverlay from './IntroOverlay';
@@ -40,28 +40,16 @@ const EXPOSURE = 0.85;
 const PLAYER_COLOR = 'w';
 
 /*
- * Distance clamps, derived from the same ray-to-ground-plane method used
- * throughout this project (Plateau's RADIUS, Backdrop's skyline), not picked
- * by feel. Both are along the camera's fixed viewing direction (BASE_POSITION
- * normalized), so "distance" and "ground-hit radius" scale together linearly.
- *
- * MIN_DISTANCE = 8. The brief's target was "the board occupies ~65% of the
- * frame at minDistance" — taken literally (board's own AABB height / frame
- * height) that lands near d=15, but the *resting* camera (CameraRig's
- * BASE_POSITION, distance 11.55) already sits closer than that, at ~90%. A
- * minDistance greater than the resting distance would make OrbitControls
- * shove the default view backward on load, changing the framing every other
- * part of this file was tuned against. 8 is instead picked to comfortably
- * clear the tallest piece on the board (the king, 1.45 units) without
- * cropping it at the frame edges when it sits in a back corner, verified by
- * screenshot at both 2200x920 and 390x844 — see CLAUDE.md.
- *
- * MAX_DISTANCE = 14. The old value (17) was never derived: at 17 the
- * bottom-frame corner ray on a 21:9 viewport hits the ground at radius 12.6,
- * past the plateau's full radius (10.5, see Plateau.jsx) — the rim's alpha
- * fade is long gone there, so widescreen players could already zoom the
- * plateau's edge into the bottom corners. 14 keeps that same corner ray
- * inside 10.5.
+ * Distance clamps. Originally derived from a ray-to-ground-plane method
+ * against Plateau's radius and Backdrop's skyline (see git history before
+ * Крок 9.6) — that ground plane is gone now (RockIsland.jsx replaced it with
+ * a small floating pedestal, see "Крок 9.6, Section C"), so the specific
+ * "stay inside the plateau's rim" reasoning no longer applies. The numbers
+ * themselves are kept as-is (not revisited this pass): MIN_DISTANCE=8 still
+ * comfortably clears the tallest piece (the king, 1.45 units) without
+ * cropping it at the frame edge, and MAX_DISTANCE=14 still frames the board
+ * reasonably at both 2200x920 and 390x844. Re-derive both properly if they
+ * ever get revisited on purpose.
  */
 const MIN_DISTANCE = 8;
 const MAX_DISTANCE = 14;
@@ -75,39 +63,20 @@ const MAX_DISTANCE = 14;
  * 16.3 degrees below horizontal — that number only falls out of this formula
  * (pitch-below-horizontal = 90 - polarAngle) with this sign convention.
  *
- * MIN_POLAR_ANGLE used to be 0.838 rad (48 degrees) — not an aesthetic
- * preference but a hard geometric requirement: Plateau's disc (radius 10.5)
- * and the painted backdrop cylinder (radius 46) never touched, leaving a bare
- * annulus of ground between them that nothing was drawn to cover. With the
- * old flat CSS sky nobody could tell (a gap showing uniform pale "sky" just
- * reads as more sky), but SkyDome's directional gradient turned that same gap
- * into a distinctly domed, wrong-toned bulge at large enough polar angles —
- * shallow, grazing views, toward the MAX_POLAR_ANGLE end, where the ray out
- * the top of frame travels far enough before crossing the ground plane to
- * fly past the old plateau's edge and read the gap.
+ * MIN_POLAR_ANGLE's whole history (0.838 rad -> 0.38 rad, see git blame on
+ * this file and on the now-deleted Plateau.jsx) was about keeping a fake
+ * continuous horizon from showing its own edge. Крок 9.6, Section C removed
+ * that horizon entirely — the board now sits on a small floating rock with
+ * open sky underneath it on purpose (see RockIsland.jsx) — so there is no
+ * ground-gap bulge left to clamp around at any angle. 0.38 rad (~22 degrees)
+ * is kept because it's still what the cinematic intro's low opening shot and
+ * the brief's own ask for this value need, not because anything would break
+ * at a smaller one now.
  *
- * Крок 8, Section A tried to close that gap by extending Plateau's ground
- * disc all the way out to the backdrop's own radius (46) — which closed it,
- * but as a single *opaque* disc with only a colour fade, it then blocked the
- * backdrop itself for shallower, more everyday polar angles (the default
- * resting camera included): see the Крок 9 correction in Plateau.jsx. The
- * disc now fades to genuine transparency by radius 15, well clear of the
- * default camera and of every polar angle Крок 8 actually unlocked (22-48
- * degrees — see that file's comment for the swept numbers). It does not
- * fully close the gap at the shallow end of the pre-existing 48-72 degree
- * range, which was reachable before Крок 8 touched anything and is left as
- * whatever it already was.
- *
- * 0.38 rad (~22 degrees) is still the value the brief asked for, and is what
- * the cinematic intro's low, near-level opening shot needs (see
- * IntroCameraRig.jsx) — that shot stays well inside the angle range the
- * ground fix actually covers.
- *
- * MAX_POLAR_ANGLE = 1.25 rad (72 degrees), tightened from the old 1.4 (80) so
- * the camera can't dip low enough to look up through the board's underside at
- * the plateau's raw backface. Independent of MIN_POLAR_ANGLE's ground-gap
- * story — that's a different edge of the range with a different constraint —
- * so it stays put.
+ * MAX_POLAR_ANGLE = 1.25 rad (72 degrees) keeps the camera from dipping low
+ * enough to look up through the board's underside / the pedestal's own
+ * backface — that constraint is about the board and pedestal specifically,
+ * not the old ground plane, so it's unaffected by Section C and stays put.
  *
  * Both are distance-independent, so they stay fixed regardless of the
  * MIN/MAX_DISTANCE tuning above.
@@ -278,7 +247,7 @@ export default function GameCanvas() {
 
         <Lighting envIntensity={tuning.envIntensity} />
         <Backdrop />
-        {SHOW_PLATEAU && <Plateau />}
+        {SHOW_ROCK_ISLAND && <RockIsland />}
 
         <Board
           board={board}

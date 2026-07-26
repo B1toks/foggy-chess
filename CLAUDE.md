@@ -400,12 +400,12 @@ pages/_app.js, _document.js, index.js   — Pages Router shell; index.js dynamic
 pages/dev-pieces.js        — dev-only piece inspector route (not part of the game)
 components/GameCanvas.jsx  — Canvas, camera, lights, OrbitControls; owns useChessGame(), computeVisibility(), and the intro/transitioning/playing phase state (see "Intro")
 components/IntroCameraRig.jsx — scripted camera for the intro's three shots + the hand-off transition into gameplay (see "Intro")
-components/IntroOverlay.jsx — the intro's stable text (title, tagline, start button); transparent, no background art of its own
+components/IntroOverlay.jsx — the intro's stable text (title, tagline, start button); transparent, no background art of its own, each text block sits on its own blurred scrim (see "Intro" -> "Крок 9.6")
 components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state; reports selected/hovered squares upward
 components/PromotionPicker.jsx — 3D piece choices above the promoting square; camera-facing, self-cancelling
-components/Plateau.jsx     — the ground under the board; alpha-dissolved rocky disc plus a far radial-gradient extension out to the backdrop's radius (see "Plateau")
+components/RockIsland.jsx  — what the board sits on: a small floating rock (temporary dark pedestal until the real model exists) — see "RockIsland"
 components/SkyDome.jsx     — full sphere behind everything, gradient + faint fbm haze (see "Camera and environment")
-components/proceduralTextures.js — canvas noise -> roughness/normal/alpha maps for the plateau, tiles, backdrop edge fade
+components/proceduralTextures.js — canvas noise -> roughness/alpha maps for the backdrop edge fade and board tiles
 components/audio.js        — synthesised SFX + wind bed, off by default
 components/Pieces.jsx      — reconciles chess.js's board into identity-stable piece instances; owns move/hover/capture animation (see "Piece interaction")
 components/PieceModel.jsx  — GLTF load + height normalization + material override (see "3D models")
@@ -868,105 +868,72 @@ took 109–114 seconds at both 1280x800 and 560x350. `window.__splat` carries
 thing to check first, along with whether a 32 MB critical-path download is
 acceptable at all.
 
-## Plateau
+## RockIsland (formerly Plateau — replaced in Крок 9.6, Section C)
 
-`components/Plateau.jsx` (`SHOW_PLATEAU` to roll it back) is the ground the
-board stands on. Without it the board hangs in the void and the scene reads as
-a model in a viewer. Three planes instead of two: board -> plateau -> fog ->
-painting.
+**What the board sits on is a different concept now, not just a different
+implementation.** Крок 8 introduced a rocky plateau disc under the board, then
+spent two more passes (Крок 9, Крок 9.6) fighting the same failure mode: a
+disc large enough to hide the gap between the board and the painted backdrop
+kept becoming a flat grey shape blocking the backdrop itself, because "close
+the gap" and "don't block the view past it" pull the disc's required radius
+in opposite directions at different camera angles (see git history on the
+now-deleted `Plateau.jsx` for the full back-and-forth, including the ray/plane
+math from the Крок 9 correction — it's a real, previously-useful derivation,
+just for a concept this section retires).
 
-`RADIUS = 10.5` is squeezed between two constraints that nearly conflict:
+Крок 9.6 stopped trying to fake a continuous horizon and changed the picture
+instead: the board sits on a **small floating rock**, the way a board might in
+a shan-shui painting, and the emptiness around and under it is the
+composition, not a gap to hide. `components/RockIsland.jsx` is the new home
+for this (`SHOW_ROCK_ISLAND` to roll it back) — `Plateau.jsx` and its three
+plateau-only procedural textures (`getStoneRoughnessMap`/`getStoneNormalMap`/
+`getPlateauAlphaMap` in `proceduralTextures.js`) are gone, not superseded in
+place.
 
-- Toward the camera it has to reach the bottom of the frame. The bottom-centre
-  ray hits the ground at radius 4.7, the bottom corners at 6.8 — 8.7 on 21:9 —
-  so the opaque core has to survive to ~7.
-- Away from the camera it has to be gone before it eats the painting. Radius
-  10.5 sits at -20.8 degrees, which leaves the skyline at -19 in clear air.
+**`ROCK_MODEL` is not set yet.** Mint is generating a rock formation with a
+flat, round top sized for the board. Until it exists, `RockIsland` renders
+`TemporaryPedestal`: a small, **sharp-edged** dark disc (`#241F19`,
+`PEDESTAL_RADIUS` = board half-width `4.3` * 1.1 = `4.73`) directly under the
+board, `receiveShadow` so it isn't flat-shaded paper under the board's own
+shadow. Deliberately not pretty on its own — the brief was explicit that this
+should read as an honest, unfinished pedestal rather than a second attempt at
+a polished-but-wrong shape ("дошка на постаменті — некрасиво, але чесно").
 
-A first pass at 15 put the far rim at -16.8, right on the frame top, and the
-mountains vanished behind a grey shelf.
+**When `ROCK_MODEL` is set**, `RockModel` loads and normalizes it the same
+way `PieceModel.jsx` handles a piece: Mint's own materials are discarded for
+one shared procedural granite `MeshStandardMaterial` (`#6E6A62`, roughness
+0.95, `flatShading: true`), `castShadow` stays off (it's the lowest thing in
+the scene, nothing below it to shadow), `receiveShadow` stays on (it needs to
+catch the board's own shadow). The actual fit — scaling so the model's flat
+top sits exactly at the pedestal's `Y` and is a little wider than the board —
+is a `TODO` in the file: measure the model's own geometry via `Box3` the way
+`normalizeHeight()` in `PieceModel.jsx` does, rather than guessing constants
+that would only happen to fit one specific export.
 
-The rim dissolves via an **alpha map, not scene fog** — fog in image mode starts
-at 44, so the plateau is entirely inside the unfogged zone. Note that
-`CircleGeometry` inscribes the disc in its UV square, so **the rim is at UV
-radius 0.5, not 1.0**; putting the fade band at 0.5-0.96 (the obvious reading)
-leaves it entirely outside the geometry and yields a fully opaque disc with a
-hard edge.
+**Camera clamps are unaffected by design, not because nothing changed.**
+`MIN_POLAR_ANGLE`'s whole history (0.838 rad down to 0.38 rad) was about a
+fake continuous horizon showing its own edge at shallow angles — see
+`GameCanvas.jsx`'s own comment on that constant. That horizon is gone on
+purpose now; there is no ground-gap bulge left to clamp around at any angle,
+because open sky beneath a floating rock is the intended read, not a bug.
+The value is kept at 0.38 rad because the cinematic intro's low opening shot
+and the original brief still want it, not because anything would break at a
+smaller one.
 
-Roughness and normal maps come from `components/proceduralTextures.js`, which
-builds canvas textures from `lib/noise.js`'s fbm. It lives in `components/`
-rather than `lib/` because it constructs `THREE.Texture` objects. fbm is not
-tileable, so anything with `repeat > 1` uses `MirroredRepeatWrapping` — plain
+**Untested against this change:** `IntroCameraRig.jsx`'s first shot
+("Крізь туман") positions the camera outside the new pedestal's tiny radius
+(~4.7, versus the old plateau's ~10.5-18) — flagged in that file's own
+comment. If that shot reads as floating in open void rather than pushing low
+across a landscape, it needs revisiting once the real rock model (or even
+just the temporary pedestal) has been checked from that exact angle.
+
+Roughness/normal-map generation (fbm-based canvas textures) still lives in
+`components/proceduralTextures.js` for the two things that still use it — the
+backdrop's edge alpha map and the board tile roughness — even though the
+plateau-specific maps are gone. It's in `components/` rather than `lib/`
+because it constructs `THREE.Texture` objects, and fbm itself is not tileable,
+so anything with `repeat > 1` there uses `MirroredRepeatWrapping` — plain
 repeat leaves a grid of seams.
-
-### Far ground extension (Крок 8, Section A; corrected in Крок 9)
-
-The rocky disc above (radius 10.5) used to be the entire ground. Beyond it
-was a bare annulus nothing had ever drawn — invisible under the old flat CSS
-sky, but a distinctly domed, wrong-toned bulge once `SkyDome`'s directional
-gradient replaced it, visible at shallow enough camera angles. That bulge was
-the entire reason `MIN_POLAR_ANGLE` had to stay at 48 degrees, which in turn
-ruled out the low, near-level camera the cinematic intro needed (see "Intro").
-
-`Plateau.jsx` renders a second mesh alongside the rocky disc: a `RingGeometry`
-with a **per-vertex radial gradient** instead of a texture — flat plateau
-stone (`#6B665C`) out to `GRADIENT_INNER` (10.5, the rocky disc's own radius,
-so the handoff matches its colour exactly), smoothstepping toward the sky's
-own horizon tone (`DOME_HORIZON_COLOR`, `#DCD6C8`) by `GRADIENT_OUTER`.
-`RingGeometry`, not a plain `CircleGeometry`: a circle's default radial
-resolution is a single ring (one triangle fan straight from the centre vertex
-to the rim), which only has two colour samples to interpolate between and
-can't hold a flat-then-ramp-then-flat curve — `phiSegments` gives real
-concentric rings of vertices to paint the gradient onto.
-
-It sits a hair below the rocky disc (`Y - 0.002`) to avoid z-fighting where
-they overlap, and does **not** receive shadows — the rocky disc already owns
-shadow receiving out to its own radius (10.5, close enough to "~12 units"
-that a second shadow-catching mesh this far from the board would just be
-wasted fill-rate).
-
-**Крок 9 correction.** The first version of this mesh ran opaque all the way
-out to the backdrop's own radius (46, matching `Backdrop.jsx`'s exported
-`RADIUS`) with only a *colour* fade, never an alpha one — so it was a full,
-solid floor for its entire extent. That blocked the painted backdrop itself:
-a flat opaque disc that large unavoidably intercepts the sightline to a wall
-46 units away for any camera whose gaze dips even slightly below horizontal,
-which is every allowed camera in this scene, the default resting position
-included. Confirmed with three.js's own ray/plane math, not eyeballed — the
-default camera's top-of-frame ray crosses this disc's plane (y=-0.317) at
-radius ~15.85 — and confirmed visually once the dev server's stale `.next`
-build (unrelated flat-grey rendering artifact that was masking this the whole
-time — see "Dev-server gotcha") was cleared: the backdrop was gone, replaced
-by exactly this disc's own flat grey gradient.
-
-The color attribute is now **4-component (RGBA)**, not 3 — three.js reads a
-4-component `color` attribute as per-vertex alpha too (`vertexAlphas` in
-`WebGLPrograms`), which is what lets this fade to genuine transparency.
-`GRADIENT_OUTER` is now 15, where alpha reaches exactly 0, chosen with margin
-under that ~15.85 default-camera threshold; `FAR_RADIUS` (the mesh's own
-extent) is trimmed to 18, a few units past full fade purely so the gradient
-has room to interpolate smoothly rather than ending on a hard mesh edge. The
-material is `transparent` with `depthWrite={false}`, matching the rocky
-disc's own rim — an opaque mesh that only faded in colour would still write
-depth across its whole extent, which is the exact mechanism that blocked the
-backdrop.
-
-This does not fully close the original gap at the shallow end of the
-pre-existing 48-72 degree polar range (unchanged by Крок 8, and not what
-regressed) — closing it there would need coverage back out past 15, which is
-too close to the default camera's own 15.85 danger line to safely chase. See
-`GameCanvas.jsx`'s `MIN_POLAR_ANGLE` comment for the full reasoning and the
-swept numbers across the camera envelope. If a seam reappears, verify with
-the same ray/plane check before changing radii again — "worst-case ray
-crosses the ground plane at radius N" is not by itself evidence of a bug; a
-ray that clears the ground and reads open `SkyDome` beyond it is correct,
-not a gap. Only a *hard-edged* mismatch (an abrupt colour or geometry
-boundary) is the thing to fix.
-
-`MIN_POLAR_ANGLE` came down from 0.838 rad (48 degrees) to 0.38 rad (~22
-degrees) once the original (Крок 8) version of this mesh landed — see "Camera
-and environment" -> "Distance and polar clamps" for the current value and
-reasoning.
 
 ## Intro
 
@@ -1075,6 +1042,58 @@ Dismissal is remembered per session via the same `sessionStorage` key the old
 title screen used. Fonts come from `next/font/google` (Zen Old Mincho for
 display, Inter for UI) and the palette lives in `styles/globals.css` as CSS
 custom properties shared with the 3D scene.
+
+### English, and a scrim instead of a shadow (Крок 9.6, Section A)
+
+**The whole UI is English now** — the project ships to an English-speaking
+client. `IntroOverlay.jsx`, `HUD.jsx`'s hint/tooltips/status-flash text are
+all translated; check any new user-facing string against that before adding
+Ukrainian anywhere outside code comments (comments documenting a Ukrainian
+brief's own wording, e.g. quoting what a brief literally asked for, are fine
+and already exist throughout this codebase — it's *player-visible* text that
+has to be English).
+
+**A `text-shadow` was never reliable here, and this pass replaced it with
+something that is.** The intro's background is a moving camera shot (three
+different scripted shots looping), not one static image — a shadow tuned to
+read against fog might wash out against a bright sky frame, or the reverse.
+`TextScrim` in `IntroOverlay.jsx` fixes contrast at its source instead: a
+soft, heavily-blurred dark radial-gradient patch, sized a little larger than
+its text and positioned first in DOM order (so normal paint order puts the
+text on top with no `z-index` needed), that travels with the text rather than
+depending on what's behind it at a given moment. Every text block in the
+overlay (eyebrow, title+description+button, footer) gets its own `TextScrim`
+wrapper; none of them carry a `text-shadow` anymore.
+
+Typography follows the brief specifically: the title is uppercase, wide
+letter-spacing (`0.25em`), weight 400 (not bold — restraint reads better
+here than emphasis); the description is smaller, weight 400, normal tracking,
+`opacity: 0.85`; the gap between them is tied to `TITLE_SIZE` (the same
+`clamp()` expression reused for both the title's `fontSize` and the
+description's `marginTop`) so the gap scales with the title rather than
+needing a second breakpoint ladder. The "Begin" button is a thin 1px
+`#C1440E` outline on a transparent background, filling solid on hover — a
+small `<style>` block with a `.intro-begin-button:hover` rule, the same
+"inject a scoped `<style>` tag" pattern `HUD.jsx` already uses for its status
+flash keyframe, since inline styles can't express `:hover` on their own.
+
+## The painted backdrop's top edge (Крок 9.6, Section B)
+
+The backdrop segments (see "Multiple segments" above) faded at their sides
+and bottom from the start, but not their top — `getBackdropEdgeAlphaMap` in
+`proceduralTextures.js` only had `edgeFade` (U) and `bottomFade` (V near 0).
+That read as a visible horizontal seam where the painting's top edge met
+`SkyDome` behind it. `topFade = smoothstep(1.0, 0.82, v)` closes it,
+symmetric to the existing bottom fade (also 18% of V). The 0.82 cutoff isn't
+arbitrary: the source image's own flat sky only extends to ~20% down from its
+top edge before the far ridges break in (the same luminance-profile
+measurement `SKYLINE_FRACTION` was derived from), so fading out the top 18%
+(down to V=0.82) stays inside that flat-sky band with a couple of percent to
+spare — the fade dissolves empty sky, never a ridge line. If a future image
+swaps in with a shorter flat-sky margin, the fix is widening the mesh's own
+height, not pushing this fraction past ~0.8 (which would fade out actual
+mountain silhouette instead of sky). Verified clean at both `minPolarAngle`
+and `maxPolarAngle`, eight azimuths each.
 
 ### Important
 
