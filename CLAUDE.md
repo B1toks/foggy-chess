@@ -403,7 +403,7 @@ components/IntroCameraRig.jsx — scripted camera for the intro's three shots + 
 components/IntroOverlay.jsx — the intro's stable text (title, tagline, start button); transparent, no background art of its own, each text block sits on its own blurred scrim (see "Intro" -> "Крок 9.6")
 components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state; reports selected/hovered squares upward
 components/PromotionPicker.jsx — 3D piece choices above the promoting square; camera-facing, self-cancelling
-components/RockIsland.jsx  — what the board sits on: a small floating rock (temporary dark pedestal until the real model exists) — see "RockIsland"
+components/RockIsland.jsx  — what the board sits on: a small floating rock (real GLB model, temporary pedestal is the rollback) — see "RockIsland"
 components/SkyDome.jsx     — full sphere behind everything, gradient + faint fbm haze (see "Camera and environment")
 components/proceduralTextures.js — canvas noise -> roughness/alpha maps for the backdrop edge fade and board tiles
 components/audio.js        — synthesised SFX + wind bed, off by default
@@ -1002,25 +1002,52 @@ plateau-only procedural textures (`getStoneRoughnessMap`/`getStoneNormalMap`/
 `getPlateauAlphaMap` in `proceduralTextures.js`) are gone, not superseded in
 place.
 
-**`ROCK_MODEL` is not set yet.** Mint is generating a rock formation with a
-flat, round top sized for the board. Until it exists, `RockIsland` renders
-`TemporaryPedestal`: a small, **sharp-edged** dark disc (`#241F19`,
-`PEDESTAL_RADIUS` = board half-width `4.3` * 1.1 = `4.73`) directly under the
-board, `receiveShadow` so it isn't flat-shaded paper under the board's own
-shadow. Deliberately not pretty on its own — the brief was explicit that this
-should read as an honest, unfinished pedestal rather than a second attempt at
-a polished-but-wrong shape ("дошка на постаменті — некрасиво, але чесно").
+`TemporaryPedestal` (small, **sharp-edged** dark disc, `#241F19`,
+`PEDESTAL_RADIUS` = board half-width `4.3` * 1.1 = `4.73`, `receiveShadow` so
+it isn't flat-shaded paper under the board's own shadow) stays in the file as
+the rollback if `ROCK_MODEL` is ever cleared — deliberately not pretty on its
+own, the brief was explicit this should read as an honest, unfinished
+pedestal rather than a second attempt at a polished-but-wrong shape ("дошка
+на постаменті — некрасиво, але чесно").
 
-**When `ROCK_MODEL` is set**, `RockModel` loads and normalizes it the same
-way `PieceModel.jsx` handles a piece: Mint's own materials are discarded for
-one shared procedural granite `MeshStandardMaterial` (`#6E6A62`, roughness
-0.95, `flatShading: true`), `castShadow` stays off (it's the lowest thing in
-the scene, nothing below it to shadow), `receiveShadow` stays on (it needs to
-catch the board's own shadow). The actual fit — scaling so the model's flat
-top sits exactly at the pedestal's `Y` and is a little wider than the board —
-is a `TODO` in the file: measure the model's own geometry via `Box3` the way
-`normalizeHeight()` in `PieceModel.jsx` does, rather than guessing constants
-that would only happen to fit one specific export.
+**Крок 10, Section E: `ROCK_MODEL` now points at Mint's delivered export**
+(`public/models/granite-pine-aerie-optimized.glb` — a low-poly rock formation
+with pine-tree silhouettes growing off its sides, per the model's own name).
+`RockModel` loads and normalizes it the same way `PieceModel.jsx` handles a
+piece: Mint's own materials are discarded for one shared procedural granite
+`MeshStandardMaterial` (`#6E6A62`, roughness 0.95, `flatShading: true`),
+`castShadow` stays off (it's the lowest thing in the scene, nothing below it
+to shadow), `receiveShadow` stays on (it needs to catch the board's own
+shadow).
+
+**The fit is measured, not guessed** — a `Box3` alone isn't enough here,
+because this model's usable surface is *not* its bounding-box max: a raised
+rim sits above the flat inner area, exactly the thing the brief warned not to
+let the board overlap. A one-time raycast grid (40 radii x 6 angles, downward
+rays against the raw model, run once behind `?debug=1` and then deleted —
+see `git log` on this file for the throwaway measurement code if it ever
+needs re-running against a regenerated export) found the flat plateau at
+local Y=0.417, constant out to radius 0.65 in every direction sampled; by
+radius 0.70 some samples had already climbed to 0.46-0.47 — the rim
+starting. `ROCK_SCALE` puts that flat radius at `BOARD_HALF_WIDTH * 1.1`
+(4.73) — the *same* margin `PEDESTAL_RADIUS` already uses, so "a little wider
+than the board" means the identical thing for the temporary disc and the real
+model. `ROCK_Y_OFFSET` then drops the scaled model so its flat top lands
+exactly at `Y`, the pedestal's own resting height. Verified visually at a
+shallow orbit (30 degrees) and from the far side of the rock (200 degrees
+azimuth): the board sits well inside the flat top with visible margin on
+every side, never touching the rim.
+
+**Not attempted this pass:** the brief also asks for the fog's lower layers
+to visibly flow over the rock's outer edge, to hide where it drops off. The
+fog plane is, and has always been, sized to the board itself (8x8, matching
+the mask texture) — it doesn't extend past the board edge onto the rest of
+the flat top, so there's no fog-over-the-rim effect currently. The exposed
+rock margin around the board reads fine on its own in practice (see the
+screenshots from this pass), so this wasn't blocking, but extending fog
+geometry to cover the rock's full flat top (and ideally drape down its outer
+face) is the natural next step if that specific composition beat matters
+enough to revisit.
 
 **Camera clamps are unaffected by design, not because nothing changed.**
 `MIN_POLAR_ANGLE`'s whole history (0.838 rad down to 0.38 rad) was about a
