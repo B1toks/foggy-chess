@@ -59,7 +59,9 @@ export const BACKDROP_IMAGE = '/textures/mountains.jpg';
  *   TOP_Y = y_skyline + 0.20 * HEIGHT
  */
 const IMAGE_ASPECT = 2560 / 1429;
-const RADIUS = 46;
+// Exported so Plateau.jsx's ground extension can reach exactly this far
+// without a second, driftable copy of the number — see "Крок 8" Section A.
+export const RADIUS = 46;
 /*
  * 200, not the ~150 that first framed well. The camera subtends up to ~50deg of
  * the wall on an ultrawide viewport (63deg of horizontal fov at 16:10, 85 at

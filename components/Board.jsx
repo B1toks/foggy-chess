@@ -27,12 +27,33 @@ const GRID_POSITIONS = (() => {
   return new Float32Array(points);
 })();
 
-export default function Board({ board, canInteract, legalMovesFrom, isPromotion, makeMove }) {
+export default function Board({
+  board,
+  canInteract,
+  legalMovesFrom,
+  isPromotion,
+  makeMove,
+  onSelectedChange,
+  onHoveredChange,
+}) {
   const [selected, setSelected] = useState(null);
   const [targets, setTargets] = useState([]);
   // A promoting move the player has aimed but not yet completed: the pawn stays
   // where it is until a piece is picked, so cancelling costs nothing.
   const [pendingPromotion, setPendingPromotion] = useState(null);
+  // Krok 8, Section C: which square the pointer is currently over, reported
+  // upward so Pieces.jsx can lift that square's piece. Kept local to Board
+  // (which already owns the pointer handlers) rather than lifted entirely,
+  // same shape as `selected` below.
+  const [hovered, setHovered] = useState(null);
+
+  useEffect(() => {
+    onSelectedChange?.(selected);
+  }, [selected, onSelectedChange]);
+
+  useEffect(() => {
+    onHoveredChange?.(hovered);
+  }, [hovered, onHoveredChange]);
 
   /*
    * One roughness map per square, each a clone of a single 512px noise texture
@@ -73,6 +94,14 @@ export default function Board({ board, canInteract, legalMovesFrom, isPromotion,
     setSelected(null);
     setTargets([]);
     setPendingPromotion(null);
+  }, [board]);
+
+  // Reset hovered separately: it isn't a board-dependent state (the pointer
+  // doesn't move just because the board did), but it must never survive a
+  // move — the square under the cursor may hold a different piece, or none,
+  // once the board updates, and a stale hover would lift the wrong thing.
+  useEffect(() => {
+    setHovered(null);
   }, [board]);
 
   function clearSelection() {
@@ -140,11 +169,15 @@ export default function Board({ board, canInteract, legalMovesFrom, isPromotion,
               }}
               onPointerOver={(event) => {
                 event.stopPropagation();
-                if (canInteract) document.body.style.cursor = 'pointer';
+                if (canInteract) {
+                  document.body.style.cursor = 'pointer';
+                  setHovered(square);
+                }
               }}
               onPointerOut={(event) => {
                 event.stopPropagation();
                 document.body.style.cursor = 'default';
+                setHovered((h) => (h === square ? null : h));
               }}
             >
               <planeGeometry args={[1, 1]} />

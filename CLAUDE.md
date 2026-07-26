@@ -204,6 +204,74 @@ render time** from `useThree`'s camera: `useFrame` does not run until after the
 first frame is committed, so without the seed the panel appears once unrotated,
 foreshortened into a clump.
 
+## Piece interaction (Крок 8, Section C)
+
+Before this pass, `Pieces.jsx` mapped `board.flat().filter(Boolean)` straight
+to `<PieceModel key={cell.square}>` every render. That's fine for a static
+board, but it makes a *move* look like the old instance at square A vanishing
+and a brand-new one appearing already in place at square B — React remounts
+on a key change, and a remount can't animate a value it never held. Getting a
+piece to visibly travel from A to B needed identity that survives the move,
+not just a snapshot of where everything currently sits.
+
+**`Pieces.jsx`'s `useAnimatedInstances` hook is the reconciliation layer.** It
+keeps its own `instances` state — `{id, type, color, square}` per piece, `id`
+stable across moves — separate from chess.js's own square-indexed board, and
+updates it from the *actual move object* (`history`'s last entry) rather than
+diffing the whole board, because chess.js already tells us exactly which
+square moved to which. Two cases a plain `from`/`to` can't cover on their own
+are resolved with the standard rule for them: **en passant** (the captured
+pawn sits behind `to`, not on it — `to[0] + from[1]`) and **castling** (the
+only move chess.js's `Move` gives us is the king's own hop; the rook's silent
+second one is filled in from `CASTLE_ROOK_HOPS`, the four fixed
+from/to squares). A defensive sync pass against the real board follows every
+reconciliation, so a missed edge case just snaps a piece into place instead of
+ever rendering the wrong thing.
+
+**Move animation is imperative, not React state**, matching the convention
+`CameraRig`/`FogLayer` already established: `AnimatedPieceGroup` sets its
+wrapping `<group>`'s position directly via a ref on mount, then only ever
+touches it again from inside `useFrame` — never a re-declared `position` prop,
+which would just snap the group to the new square before the animation had a
+chance to run. When the `square` prop it's fed changes, an effect records a
+`{from, to}` arc; `useFrame` walks it forward over `MOVE_DURATION` (0.35s)
+with `easeInOutCubic` (`lib/easing.js`) and adds `Math.sin(p * π) *
+MOVE_ARC_HEIGHT` on top of the interpolated Y, so the piece rises and falls
+across the move instead of sliding flat. Because each `AnimatedPieceGroup` is
+keyed by the piece's persistent `id` (not its square), React keeps the *same*
+component mounted across the move and the animation runs; a piece that was
+outside `visibility` (an unseen enemy move) and only becomes visible again
+later mounts fresh at its current square instead — correct, since the player
+never saw whatever it did while hidden.
+
+**Captures fade instead of vanishing.** A displaced piece doesn't just drop
+out of `instances` — it moves into a separate `ghosts` list and renders as a
+short-lived `<CaptureGhost>` that fades its own opacity to 0 over
+`CAPTURE_FADE_DURATION` (0.4s) before calling back to remove itself. This
+needed one change to `PieceModel.jsx`: every *live* piece shares one of two
+module-level `MeshStandardMaterial` singletons (`BONE`/`LACQUER`) — cheap, but
+it means animating opacity on one piece would fade every piece of that colour.
+`PieceModel`'s new `fade` prop clones the shared material once for that
+instance instead of reusing it, so `CaptureGhost` can drive its own opacity
+independently. Ghosts are short-lived (one fade, then unmounted), so the extra
+material instance per capture never accumulates. A ghost only spawns for a
+capture that was actually on screen a moment before — White's own pieces
+always are, an enemy piece only if it was inside `visibility` — a capture on a
+square the player never saw shouldn't flash a piece into view just to fade it
+back out.
+
+**Hover/selected lift is a second, separate imperative animation**, riding on
+its own inner `<group>` so it never fights the move animation over one
+`Vector3`. `Board.jsx` already owned the pointer handlers; it now also tracks
+`hovered` (mirroring `selected`) and reports both upward via
+`onHoveredChange`/`onSelectedChange` callback props, since `Pieces.jsx` is a
+sibling of `Board`, not a child, and needs the values lifted into
+`GameCanvas.jsx` to receive them. Only the player's own piece on the
+hovered/selected square lifts (`HOVER_LIFT = 0.03`), exponentially smoothed
+(`1 - Math.exp(-HOVER_LERP_SPEED * delta)`) toward the target each frame
+rather than snapping, which is what makes it read as "rises, and returns" —
+the brief's "фігура ледь підіймається і повертається" — instead of a toggle.
+
 ## Sound
 
 `components/audio.js` — everything synthesised through Web Audio, no audio
@@ -218,6 +286,39 @@ bottom-right corner is the user gesture that resumes the AudioContext.
 Move and capture sounds are voiced in `GameCanvas` by watching `history` grow,
 not from the click — that way the AI's moves are voiced by the same path as the
 player's, and `lib/` stays browser-free. Only `select` is fired from `Board`.
+
+## HUD
+
+`components/HUD.jsx`, reworked in Крок 8 Section C toward "less interface":
+
+- **No card.** The status text used to sit in a bordered, backgrounded panel;
+  it's now plain text directly on the scene, legibility carried by a
+  text-shadow instead of a background chip.
+- **Check/checkmate get a dedicated flash** — `StatusFlash` — the board's own
+  ember (`#C1440E`), large, centred at the top of the frame, with a brief
+  `hud-status-flash` keyframe fade-in. Text is Ukrainian ("Шах"/"Мат")
+  specifically because that's what the brief asked for there, even though the
+  smaller ongoing status line next to it is still English — a pre-existing
+  inconsistency this pass didn't take on fixing everywhere.
+- **Sound and "New game" share one corner and one visual style** (the
+  `CORNER_BUTTON_STYLE` object both buttons spread) — small, semi-transparent
+  square icon buttons, bottom-right. "New game" only renders once
+  `showGameplay` is true (nothing to restart before then) and is deliberately
+  understated mid-game (`opacity: 0.55`) versus full strength once the game is
+  actually over (`prominent` prop) — a restart is a destructive, rarely-wanted
+  action while a game is still live.
+- **A control hint** (`ControlHint`, "Перетягніть, щоб обертати · Колесо —
+  масштаб") appears bottom-centre for `HINT_VISIBLE_MS` (8s) and fades over
+  `HINT_FADE_MS` (1.2s). It ties to its own mount time via a plain
+  `useEffect`/`setTimeout` — since `HUD` only renders it once `phase` reaches
+  `'playing'` (see "Intro"), mount time already *is* "the first 8 seconds of
+  the game," no extra clock needed.
+
+`showGameplay` (passed from `GameCanvas.jsx` as `phase === 'playing'`) gates
+everything except the sound toggle, which stays available through the intro
+too — it's a global preference, not part of the game state, and the intro's
+own wind-bed ambience is worth being able to turn on before the board is even
+interactive.
 
 ## 3D models
 
@@ -297,19 +398,22 @@ of eyeballing pixels when a proportion looks off.
 ```
 pages/_app.js, _document.js, index.js   — Pages Router shell; index.js dynamic-imports GameCanvas (ssr:false)
 pages/dev-pieces.js        — dev-only piece inspector route (not part of the game)
-components/GameCanvas.jsx  — Canvas, camera, lights, OrbitControls; owns useChessGame() + computeVisibility()
-components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state
+components/GameCanvas.jsx  — Canvas, camera, lights, OrbitControls; owns useChessGame(), computeVisibility(), and the intro/transitioning/playing phase state (see "Intro")
+components/IntroCameraRig.jsx — scripted camera for the intro's three shots + the hand-off transition into gameplay (see "Intro")
+components/IntroOverlay.jsx — the intro's stable text (title, tagline, start button); transparent, no background art of its own
+components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state; reports selected/hovered squares upward
 components/PromotionPicker.jsx — 3D piece choices above the promoting square; camera-facing, self-cancelling
-components/Plateau.jsx     — the ground under the board; alpha-dissolved rim (see "Plateau")
+components/Plateau.jsx     — the ground under the board; alpha-dissolved rocky disc plus a far radial-gradient extension out to the backdrop's radius (see "Plateau")
 components/SkyDome.jsx     — full sphere behind everything, gradient + faint fbm haze (see "Camera and environment")
 components/proceduralTextures.js — canvas noise -> roughness/normal/alpha maps for the plateau, tiles, backdrop edge fade
 components/audio.js        — synthesised SFX + wind bed, off by default
-components/Pieces.jsx      — maps chess.js cells -> PieceModel; skips opponent pieces outside `visibility`
+components/Pieces.jsx      — reconciles chess.js's board into identity-stable piece instances; owns move/hover/capture animation (see "Piece interaction")
 components/PieceModel.jsx  — GLTF load + height normalization + material override (see "3D models")
 components/DevPieceRow.jsx — dev-only side-on comparison row + measurement probe
 components/FogLayer.jsx    — 64 persistent fog planes, opacity lerped imperatively in useFrame (never via React state)
-components/HUD.jsx         — plain DOM overlay (turn/status/new game), absolutely positioned over the canvas
+components/HUD.jsx         — plain DOM overlay (turn/status, sound + new-game corner, control hint), absolutely positioned over the canvas
 lib/coords.js              — squareToWorld/worldToSquare, board centered at origin, a1 at the corner, 1 unit/cell
+lib/easing.js              — easeInOutCubic, shared by the intro camera and the board's move animation
 lib/pieces.js              — PIECE_CONFIG (model path + targetHeight) and CODE_TO_PIECE ('n' -> 'knight')
 lib/useChessGame.js        — chess.js wrapper hook; isPromotion(); owns the AI-move effect (setTimeout keyed off turn/status)
 lib/visibility.js          — computeVisibility(game, color) -> Set<string>; unit-tested (lib/visibility.test.js)
@@ -428,21 +532,26 @@ CameraRig's imperative override is exactly the bug to avoid: drei re-applies
 declared props on some later re-render and would stomp the scaled values back
 to the landscape numbers.
 
-`MIN_POLAR_ANGLE = 0.838` rad (48 degrees) is **not** the "don't let the
-camera climb too vertical" aesthetic call it looks like — it is a hard
-geometric requirement, found empirically, not derived up front. Plateau's disc
-(radius 10.5) and the painted backdrop cylinder (radius 46) never touch —
-there's a bare annulus of ground between them nothing was ever drawn to cover.
-With the old flat CSS sky this was invisible (a gap showing uniform pale "sky"
-just reads as more sky). SkyDome's gradient is directional, so the exact same
-always-existing gap now shows up as a distinctly domed, wrong-toned bulge the
-instant the camera pitches shallow enough to see across it — confirmed visible
-through 40 degrees, gone by 45, at both MIN_DISTANCE and MAX_DISTANCE. 48 keeps
-a few degrees of margin. **If a future change moves the plateau or backdrop
-radius, re-check this angle** — closing the ground gap directly (extending
-Plateau's radius, or the backdrop cylinder's bottom edge, to actually meet)
-would be the more robust fix and would let this angle come back down, but
-wasn't attempted this pass.
+`MIN_POLAR_ANGLE = 0.38` rad (~22 degrees). It used to be 0.838 rad (48
+degrees) — not an aesthetic call but a hard geometric requirement, found
+empirically: Plateau's disc (radius 10.5) and the painted backdrop cylinder
+(radius 46) never touched, leaving a bare annulus of ground between them that
+nothing was drawn to cover. With the old flat CSS sky this was invisible (a
+gap showing uniform pale "sky" just reads as more sky); SkyDome's directional
+gradient turned that same gap into a distinctly domed, wrong-toned bulge the
+instant the camera pitched shallow enough to see across it — visible through
+40 degrees, gone by 45.
+
+**Крок 8, Section A closed the gap for good instead of just clamping around
+it** — see "Plateau" below for the large radial-gradient disc that now
+reaches all the way to the backdrop's own radius. With no gap left to hide,
+0.38 rad is the value the brief asked for, and it's also what the cinematic
+intro needs: its top-down shot sits at ~45 degrees (comfortably inside this
+bound) and its low, near-level opening shot needs the shallowest angle of any
+camera position in the scene, scripted or player-driven (see "Intro"). If a
+future change moves the plateau or backdrop radius and a seam reappears,
+raise this in 2-degree steps rather than jumping back to 48 — the ground fix
+is the more robust lever now that it exists.
 
 `MAX_POLAR_ANGLE = 1.25` rad (72 degrees), tightened from the old 1.4 (80) so
 the camera can't dip low enough to see up through the board's underside at the
@@ -463,8 +572,10 @@ was needed beyond what OrbitControls already does.
 
 `GameCanvas.jsx`'s `DebugHooks` component (gated behind `?debug=1`, same
 convention as HUD's vision counter) exposes `window.__scene`, `window.__camera`,
-`window.__gl`, `window.__controls`. This is what makes camera-limit testing
-possible at all without approximating a position via imprecise mouse drags:
+`window.__gl`, `window.__controls`, and `window.__phase` (the intro/
+transitioning/playing state machine — see "Intro"). This is what makes
+camera-limit testing possible at all without approximating a position via
+imprecise mouse drags:
 
 ```js
 // in a Playwright page.evaluate:
@@ -677,13 +788,190 @@ rather than `lib/` because it constructs `THREE.Texture` objects. fbm is not
 tileable, so anything with `repeat > 1` uses `MirroredRepeatWrapping` — plain
 repeat leaves a grid of seams.
 
+### Far ground extension (Крок 8, Section A; corrected in Крок 9)
+
+The rocky disc above (radius 10.5) used to be the entire ground. Beyond it
+was a bare annulus nothing had ever drawn — invisible under the old flat CSS
+sky, but a distinctly domed, wrong-toned bulge once `SkyDome`'s directional
+gradient replaced it, visible at shallow enough camera angles. That bulge was
+the entire reason `MIN_POLAR_ANGLE` had to stay at 48 degrees, which in turn
+ruled out the low, near-level camera the cinematic intro needed (see "Intro").
+
+`Plateau.jsx` renders a second mesh alongside the rocky disc: a `RingGeometry`
+with a **per-vertex radial gradient** instead of a texture — flat plateau
+stone (`#6B665C`) out to `GRADIENT_INNER` (10.5, the rocky disc's own radius,
+so the handoff matches its colour exactly), smoothstepping toward the sky's
+own horizon tone (`DOME_HORIZON_COLOR`, `#DCD6C8`) by `GRADIENT_OUTER`.
+`RingGeometry`, not a plain `CircleGeometry`: a circle's default radial
+resolution is a single ring (one triangle fan straight from the centre vertex
+to the rim), which only has two colour samples to interpolate between and
+can't hold a flat-then-ramp-then-flat curve — `phiSegments` gives real
+concentric rings of vertices to paint the gradient onto.
+
+It sits a hair below the rocky disc (`Y - 0.002`) to avoid z-fighting where
+they overlap, and does **not** receive shadows — the rocky disc already owns
+shadow receiving out to its own radius (10.5, close enough to "~12 units"
+that a second shadow-catching mesh this far from the board would just be
+wasted fill-rate).
+
+**Крок 9 correction.** The first version of this mesh ran opaque all the way
+out to the backdrop's own radius (46, matching `Backdrop.jsx`'s exported
+`RADIUS`) with only a *colour* fade, never an alpha one — so it was a full,
+solid floor for its entire extent. That blocked the painted backdrop itself:
+a flat opaque disc that large unavoidably intercepts the sightline to a wall
+46 units away for any camera whose gaze dips even slightly below horizontal,
+which is every allowed camera in this scene, the default resting position
+included. Confirmed with three.js's own ray/plane math, not eyeballed — the
+default camera's top-of-frame ray crosses this disc's plane (y=-0.317) at
+radius ~15.85 — and confirmed visually once the dev server's stale `.next`
+build (unrelated flat-grey rendering artifact that was masking this the whole
+time — see "Dev-server gotcha") was cleared: the backdrop was gone, replaced
+by exactly this disc's own flat grey gradient.
+
+The color attribute is now **4-component (RGBA)**, not 3 — three.js reads a
+4-component `color` attribute as per-vertex alpha too (`vertexAlphas` in
+`WebGLPrograms`), which is what lets this fade to genuine transparency.
+`GRADIENT_OUTER` is now 15, where alpha reaches exactly 0, chosen with margin
+under that ~15.85 default-camera threshold; `FAR_RADIUS` (the mesh's own
+extent) is trimmed to 18, a few units past full fade purely so the gradient
+has room to interpolate smoothly rather than ending on a hard mesh edge. The
+material is `transparent` with `depthWrite={false}`, matching the rocky
+disc's own rim — an opaque mesh that only faded in colour would still write
+depth across its whole extent, which is the exact mechanism that blocked the
+backdrop.
+
+This does not fully close the original gap at the shallow end of the
+pre-existing 48-72 degree polar range (unchanged by Крок 8, and not what
+regressed) — closing it there would need coverage back out past 15, which is
+too close to the default camera's own 15.85 danger line to safely chase. See
+`GameCanvas.jsx`'s `MIN_POLAR_ANGLE` comment for the full reasoning and the
+swept numbers across the camera envelope. If a seam reappears, verify with
+the same ray/plane check before changing radii again — "worst-case ray
+crosses the ground plane at radius N" is not by itself evidence of a bug; a
+ray that clears the ground and reads open `SkyDome` beyond it is correct,
+not a gap. Only a *hard-edged* mismatch (an abrupt colour or geometry
+boundary) is the thing to fix.
+
+`MIN_POLAR_ANGLE` came down from 0.838 rad (48 degrees) to 0.38 rad (~22
+degrees) once the original (Крок 8) version of this mesh landed — see "Camera
+and environment" -> "Distance and polar clamps" for the current value and
+reasoning.
+
 ## Intro
 
-`components/IntroOverlay.jsx` states the one rule that makes the game legible
-to a stranger, then gets out of the way. Dismissal is remembered per session
-via `sessionStorage`. Fonts come from `next/font/google` (Zen Old Mincho for
+Крок 8, Section B replaced the old static title screen (a full-viewport dialog
+with its own background art, blocking the canvas underneath) with a short,
+looping cinematic. **The game is already mounted and running underneath from
+the first frame** — the intro is a different camera and a transparent text
+overlay on top of the exact same scene, not a second one. Doubling the scene
+would double the load; see "Important" further down.
+
+`GameCanvas.jsx` owns a three-state machine — `phase`: `'intro'` ->
+`'transitioning'` -> `'playing'` — read once at mount from `sessionStorage`
+(`initialPhase()`), so a repeat visit within the same session skips straight
+to `'playing'`, same as the old title screen's dismissal memory. The two
+non-`'playing'` states swap which camera owns the frame:
+
+- **`'intro'` / `'transitioning'`**: `components/IntroCameraRig.jsx` mounts
+  inside `<Canvas>` and drives `camera.position`/`camera.lookAt()` directly
+  every frame — the same imperative-in-`useFrame` convention `CameraRig.jsx`
+  already uses, and for the same reason (a per-frame `setState` would
+  re-render the whole tree for the intro's 14-second loop). Real
+  `OrbitControls` + `CameraRig` are **not mounted at all** during these two
+  phases — not disabled, absent — because the three shots are scripted cuts
+  (frame 2 orbits *around a piece*, not the board's centre) that a spherical
+  orbit around one fixed target can't produce.
+- **`'playing'`**: the usual `CameraRig` + `OrbitControls`, exactly as before
+  Section B.
+
+### The three shots
+
+`IntroCameraRig.jsx`'s `FRAMES` array is three shots, each a straight
+`lerpVectors` between a `from` and a `to` position/target pair, eased with
+`easeInOutCubic` (`lib/easing.js` — shared with the board's own move
+animation, see "Piece interaction"), not linear:
+
+1. **"Крізь туман"** (0-5s) — low (`y ≈ 0.5-0.6`), near-level, pushing forward
+   over the board. This is the shot Section A's ground extension exists for:
+   at this height and pitch the camera looks almost straight across the
+   plateau toward the horizon, which is exactly the angle that used to expose
+   the bare-ground gap (see "Camera and environment" -> "Distance and polar
+   clamps"). It would not have been possible to frame this shot cleanly before
+   that fix.
+2. **"Фігура виринає"** (5-10s) — close and side-on to the black knight on
+   g8, a slow lateral drift around it.
+3. **"Дошка згори"** (10-14s) — rises to a near-45-degree bird's-eye that
+   reads the whole board: White's near half clear, Black's far half fogged.
+
+The cut *between* shots is a 0.6-second crossfade through a warm near-black
+wash (`#181510`, "чорно-кремовий" in the brief — a dark warm tone, not pure
+RGB black), not a camera pan — panning smoothly from "close on a piece" to
+"bird's-eye pull-back" would just be a fast, disorientating swoop, and a
+hidden cut reads as intentional editing instead. `crossfadeAlpha(t)` computes
+a triangular pulse (0.3s each side) centred on every boundary in
+`CROSSFADE_BOUNDARIES` (`[0, 5, 10]`, plus the wraparound from 14 back to 0 —
+the loop point is a cut too), and `IntroCameraRig` writes it straight onto a
+DOM node's `style.opacity` via a ref (`overlayRef`) passed in from
+`GameCanvas.jsx`, the same "mutate a DOM ref from inside `useFrame`, never
+React state" pattern the crossfade and the hover-lift both use. That DOM node
+(the actual wash `<div>`) lives in `GameCanvas.jsx`, *outside* the `<Canvas>` —
+crossing the React-DOM/R3F boundary through a plain ref is fine, it's still
+just a ref.
+
+### Reusing the real fog-of-war instead of mocking it
+
+The three shots don't get a separate, hand-authored "looks foggy" scene —
+`GameCanvas.jsx` feeds `Fog` and `Pieces` a different `visibility` Set
+per intro frame (`introVisibilityFor`), and the *real* fog shader and the
+*real* piece-visibility rule (an enemy piece outside `visibility` isn't
+rendered at all) do the rest:
+
+- **Frame 0** uses an **empty** Set. Every square reads as fogged, including
+  the ones holding White's own pieces (which always render regardless of
+  visibility) — that's what gives "фігур майже не видно, тільки силуети"
+  (pieces barely visible, only silhouettes) for free.
+- **Frame 1** uses a Set containing exactly one square: `g8`, the black
+  knight's home square. That makes the knight the *only* enemy piece that
+  renders, sitting right at the fog mask's frontier — and the fog shader
+  already thickens the visible/fogged boundary there (see "Fog" ->
+  "Wisp structure"), which is exactly the "half in mist, half lit" edge the
+  brief asked for. No extra shader work needed for it.
+- **Frame 2** uses the real, live starting-position `visibility` computed the
+  normal way in `GameCanvas.jsx`. The near-clear/far-fogged bird's-eye read
+  isn't a mockup of the mechanic — it's the mechanic, rendered a beat before
+  the player ever touches the board.
+
+### The hand-off into gameplay
+
+Clicking "Почати партію" (`components/IntroOverlay.jsx`'s button; `Escape`,
+`Space`, and `Enter` do the same) sets `phase` to `'transitioning'`. An effect
+in `IntroCameraRig.jsx` fires on that exact transition and captures wherever
+the camera/target happened to be that instant as the start of a 1.2-second
+`easeInOutCubic` move to `CameraRig.jsx`'s `basePositionFor(aspect)` /
+`[0, 0, 0]` — the same resting position and target the game always opens on.
+Once that move completes (`p >= 1`), `onTransitionComplete` sets `phase` to
+`'playing'`, which unmounts `IntroCameraRig` and mounts real
+`CameraRig`/`OrbitControls` in the same commit. Both sides target the exact
+same `basePositionFor(aspect)`, so there is no pop at the hand-off.
+
+`IntroOverlay.jsx` itself carries no background art (the old `TitleScreen.jsx`
+did, and fully occluded the canvas — this is what "the intro is the same
+scene, not a second one" meant to fix). It's a transparent, mostly
+`pointer-events: none` layer — only the button is clickable — with the title,
+a one-line statement of the mechanic, and a footer, all in fixed screen
+position so the text stays completely still while the camera moves under it.
+Dismissal is remembered per session via the same `sessionStorage` key the old
+title screen used. Fonts come from `next/font/google` (Zen Old Mincho for
 display, Inter for UI) and the palette lives in `styles/globals.css` as CSS
 custom properties shared with the 3D scene.
+
+### Important
+
+Never build a second scene, mock board, or standalone camera rig for a future
+cinematic moment (a win screen, a replay, anything like it). Reuse the
+mounted `Board`/`Pieces`/`Fog`/`Backdrop` tree and drive it with a different
+camera and a different `visibility` Set, the way this section does — that is
+the entire reason the intro doesn't cost a second load.
 
 ## QA hooks
 
@@ -697,6 +985,16 @@ custom properties shared with the 3D scene.
 - `?debug=1` brings back the HUD's `visible: N / 64` readout, which
   cross-checks the unit test live in the browser. It is off by default
   (`SHOW_DEBUG` in `components/HUD.jsx`).
+- **The cinematic intro (see "Intro") now plays on every fresh session**,
+  which means every other QA flow below that needs the live board — clicking
+  a square, reading `visible: N / 64`, opening the promotion picker — has to
+  get past it first. The fastest way in a script: navigate once, set
+  `sessionStorage.setItem('dead-reckoning:intro-seen', '1')`, then navigate
+  again (a plain in-page write doesn't retroactively change the phase this
+  render already committed to). `window.__phase` (exposed under the same
+  `?debug=1` hook as the camera/controls, see below) confirms which state a
+  script actually landed in — `'intro'`, `'transitioning'`, or `'playing'` —
+  without guessing from the camera position.
 - `/dev-pieces` — side-on piece inspector, writes real measurements to
   `window.__pieceMeasurements`. Read `halfWidth` from there rather than
   eyeballing the row: the side-on view shows footprint X, and the piece that
@@ -707,10 +1005,12 @@ custom properties shared with the 3D scene.
   `THREE.PerspectiveCamera` at `[3.5, 7, -8.5]`, fov 42, `lookAt(0,0,0)` in
   Node and `project()` the world coordinate. `CameraRig` leaves that position
   alone at aspect >= 1.3, so the projection is exact.
-- `?debug=1` also exposes `window.__scene`/`__camera`/`__gl`/`__controls` (see
-  "Camera and environment" -> "QA hook: exact camera placement from a script")
-  — set `camera.position` directly and call `controls.update()` to test an
-  exact spherical position, including ones that should get clamped.
+- `?debug=1` also exposes `window.__scene`/`__camera`/`__gl`/`__controls`/
+  `__phase` (see "Camera and environment" -> "QA hook: exact camera placement
+  from a script") — set `camera.position` directly and call `controls.update()`
+  to test an exact spherical position, including ones that should get clamped.
+  Note `__controls` is only populated once `__phase` reaches `'playing'` — see
+  the bullet above.
 - `?fen=4k3/8/8/8/8/8/8/4K3 w - - 0 1` (kings only) fogs 58 of 64 squares —
   the fastest way to get a large, clean area of deep fog to inspect the wisp
   shader's actual structure rather than guessing from the ~24-square starting
@@ -731,6 +1031,20 @@ verify:
 - Do not conclude a control is broken from a click timeout. Trace it: an
   earlier session burned several iterations "fixing" a title-screen button that
   worked correctly the whole time.
+- Крок 8 found a second, sharper version of the same trap: even
+  `page.mouse.click(x, y)` can freeze the whole R3F render loop dead in this
+  environment (`useFrame` simply stops ticking — not the animation, everything)
+  after landing on a real click, for no error the page or console ever surfaces.
+  It reproduced on the intro's "Почати партію" button specifically: `phase`
+  correctly flipped to `'transitioning'` (proven by reading `window.__phase`),
+  but the camera stayed frozen at its exact pre-click position for 15+ seconds
+  afterward. Confirmed environment-only, not a real bug: dispatching the same
+  click **programmatically** — `button.click()` via `page.evaluate`, or raw
+  `PointerEvent`/`MouseEvent` dispatch on `document.elementFromPoint(x, y)` for
+  a canvas target that isn't a DOM element — completes normally every time,
+  transition included. If a real user gesture needs to be simulated here,
+  prefer a programmatic dispatch over `page.mouse.click` and don't conclude a
+  hand-off or button is broken just because the mouse-driven version stalled.
 - `drawImage` on the WebGL canvas reads back black (no `preserveDrawingBuffer`).
   To sample rendered pixels, screenshot with Playwright and decode the PNG in
   Node instead.
@@ -753,7 +1067,18 @@ phantom geometry, or 500s with
 `SyntaxError: Unexpected non-whitespace character after JSON` from a
 half-written `.next` manifest. **Before debugging a weird visual artifact,
 kill the server, `rm -rf .next`, and restart** — that has already resolved
-two "bugs" that did not exist in the source.
+three "bugs" that did not exist in the source. The third, from Крок 9: an
+entire session's worth of screenshots showed `SkyDome`, the painted backdrop,
+and `Plateau`'s stone all rendering as a single flat, uniform grey — read at
+the time as "this headless environment's software rasterizer can't shade
+these," and written up as such. It wasn't that. A `rm -rf .next` + restart
+later in a subsequent session, prompted by unrelated repeated
+`page.evaluate: Execution context was destroyed` errors (themselves caused by
+Fast Refresh full-reloads mid-script), made the exact same background
+suddenly render its real gradients and the painted valley in full colour, no
+code changes involved. **Don't trust a "the renderer can't do this" verdict
+reached without first ruling out a stale `.next` build** — it's a much
+cheaper thing to eliminate than it is to design around.
 
 Run `npm test` (Node's built-in test runner, no extra deps) to check
 `lib/visibility.js` — it asserts the starting position gives white exactly
