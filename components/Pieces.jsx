@@ -3,7 +3,13 @@ import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { squareToWorld } from '../lib/coords';
 import { CODE_TO_PIECE } from '../lib/pieces';
-import { easeInOutCubic } from '../lib/easing';
+import { easeInOutCubic, easeOutCubic } from '../lib/easing';
+import {
+  FOG_PIECE_REVEAL_FADE_DURATION,
+  FOG_REVEAL_THICKEN_DURATION,
+  FOG_WAVE_DELAY_PER_CELL,
+  squareChebyshevDistance,
+} from '../lib/fog';
 import PieceModel from './PieceModel';
 
 const PLAYER_COLOR = 'w';
@@ -166,14 +172,27 @@ function useAnimatedInstances(board, lastMove, historyLength, visibility) {
  * the old position to the new one, and useFrame walks it forward. The inner
  * group is a separate, much smaller offset for the hover/selected lift, so
  * the two animations don't fight over one Vector3.
+ *
+ * Крок 10, Section C: an enemy piece's first-ever mount *is* its reveal — see
+ * the "First mount" comment below, already true before this section existed.
+ * `revealDelay` (only meaningful the instant this component is first
+ * created) holds the piece at opacity 0 for that many seconds — matching the
+ * fog's own thicken-then-disperse hold over the same square, see FogShader —
+ * then fades it in over FOG_PIECE_REVEAL_FADE_DURATION. `revealFade` is
+ * captured once via useRef's lazy initializer, not re-read from props on
+ * every render, because the whole point is "was this instance's *first*
+ * mount a reveal" — a value that must never change for the life of this
+ * component instance.
  */
-function AnimatedPieceGroup({ type, color, square, lifted }) {
+function AnimatedPieceGroup({ type, color, square, lifted, revealDelay }) {
   const outerRef = useRef(null);
   const liftRef = useRef(null);
   const currentSquare = useRef(square);
   const anim = useRef(null);
   const liftAmount = useRef(0);
   const mounted = useRef(false);
+  const revealFade = useRef(revealDelay != null).current;
+  const revealElapsed = useRef(0);
 
   useEffect(() => {
     const outer = outerRef.current;
@@ -184,6 +203,12 @@ function AnimatedPieceGroup({ type, color, square, lifted }) {
       outer.position.set(x, y, z);
       mounted.current = true;
       currentSquare.current = square;
+      if (revealFade) {
+        revealElapsed.current = 0;
+        liftRef.current?.traverse((node) => {
+          if (node.isMesh && node.material) node.material.opacity = 0;
+        });
+      }
       return;
     }
     if (square === currentSquare.current) return;
@@ -218,12 +243,26 @@ function AnimatedPieceGroup({ type, color, square, lifted }) {
       liftAmount.current += (target - liftAmount.current) * t;
       lift.position.y = liftAmount.current;
     }
+
+    if (revealFade) {
+      revealElapsed.current += delta;
+      const p = Math.min(
+        1,
+        Math.max(0, (revealElapsed.current - revealDelay) / FOG_PIECE_REVEAL_FADE_DURATION),
+      );
+      const opacity = easeOutCubic(p);
+      if (lift) {
+        lift.traverse((node) => {
+          if (node.isMesh && node.material) node.material.opacity = opacity;
+        });
+      }
+    }
   });
 
   return (
     <group ref={outerRef}>
       <group ref={liftRef}>
-        <PieceModel type={type} color={color} />
+        <PieceModel type={type} color={color} fade={revealFade} />
       </group>
     </group>
   );
@@ -282,6 +321,17 @@ export default function Pieces({
           const lifted =
             inst.color === PLAYER_COLOR &&
             (inst.square === selectedSquare || inst.square === hoveredSquare);
+          // Same distance-from-origin stagger + thicken hold FogShader uses
+          // for this square's own fog wave (lib/fog.js), computed
+          // independently here so the piece and the fog it's emerging from
+          // read as one event without the two components sharing state. Only
+          // meaningful the instant AnimatedPieceGroup first mounts — see its
+          // own comment.
+          const revealDelay =
+            inst.color !== PLAYER_COLOR
+              ? (lastMove ? squareChebyshevDistance(inst.square, lastMove.to) * FOG_WAVE_DELAY_PER_CELL : 0) +
+                FOG_REVEAL_THICKEN_DURATION
+              : null;
           return (
             <AnimatedPieceGroup
               key={inst.id}
@@ -289,6 +339,7 @@ export default function Pieces({
               color={inst.color}
               square={inst.square}
               lifted={lifted}
+              revealDelay={revealDelay}
             />
           );
         })}

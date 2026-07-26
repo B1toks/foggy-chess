@@ -12,12 +12,16 @@ import {
   FOG_LAYER_ALPHA_MULT,
   FOG_LAYER_HEIGHTS,
   FOG_LAYERS,
-  FOG_LERP_SPEED,
   FOG_MAX_ALPHA,
+  FOG_REVEAL_THICKEN_DURATION,
   FOG_TINT_COLOR,
+  FOG_WAVE_DELAY_PER_CELL,
+  FOG_WAVE_DURATION,
   FOG_WISP_OCTAVES,
+  squareChebyshevDistance,
   squareToMaskIndex,
 } from '../lib/fog';
+import { easeOutCubic } from '../lib/easing';
 import { FBM_GLSL } from '../lib/noise';
 
 const VERTEX_SHADER = /* glsl */ `
@@ -121,7 +125,21 @@ function densityAndShapeGLSL() {
     // are exactly (1,0,0,0) at a texel centre — so ownVisible is the true
     // discrete 0/1 state of *this* square, never a neighbour's blend.
     vec2 cellUv = (floor(vUv * 8.0) + 0.5) / 8.0;
-    float ownVisible = texture2D(uMask, cellUv).r;
+    vec2 ownMask = texture2D(uMask, cellUv).rg;
+    // R: this square's current wave-eased visibility (0 fogged .. 1 clear),
+    // already shaped into an outward-travelling wave on the CPU side (see
+    // FogShader's useFrame) rather than a flat lerp — so the existing
+    // density/alpha math below reproduces the wave for free, no shader-side
+    // timing needed for the core open/close mechanic.
+    float ownVisible = ownMask.r;
+    // G: the wall-clock moment this square's reveal wave was scheduled to
+    // start (Крок 10, Section C — "час, коли клітинка стала видимою"). Used
+    // only for a bounded, decaying turbulence pulse right as the wave front
+    // passes through — the reveal should read as fog getting blown apart,
+    // not a plain crossfade. -999.0 (never revealed) decays to a permanent
+    // zero pulse rather than a spurious spike.
+    float revealAge = uTime - ownMask.g;
+    float revealPulse = ownMask.g > -500.0 ? exp(-abs(revealAge) * 3.0) : 0.0;
 
     // Three non-parallel, non-proportional drift vectors — not one vector
     // scaled and negated — so the wisp structure keeps reconfiguring as it
@@ -148,7 +166,11 @@ function densityAndShapeGLSL() {
     // wherever shaped is used below), deliberately faint.
     float detail = ${FOG_ENABLE_DETAIL ? "ridgedDetail(stretched * 11.0 * uScale + driftDetail) * 0.35" : "0.0"};
 
-    float clouds = mass * 0.5 + wisps * 0.4 + detail * 0.25;
+    // revealPulse briefly boosts the wisp scale right as this square's wave
+    // starts moving — a short-lived flourish on top of the wave's own alpha
+    // motion, not a second source of readability (it never touches ownVisible
+    // or the base density term below).
+    float clouds = mass * 0.5 + wisps * (0.4 + revealPulse * 0.3) + detail * 0.25;
 
     // A wisp along the frontier. The mask gradient peaks exactly where
     // visible meets fogged, so it thickens the boundary and keeps it from
@@ -345,13 +367,44 @@ function layerParams(index, height) {
   };
 }
 
-export default function FogShader({ visibility }) {
-  const current = useRef(new Float32Array(64));
-  const target = useRef(new Float32Array(64));
+/*
+ * Крок 10, Section C: state that drives the per-square wave instead of a flat
+ * exponential lerp. Indexed by mask index (squareToMaskIndex), not board
+ * order, so it lines up directly with the DataTexture's own layout.
+ *
+ * - `effective` is what actually gets written into the mask's R channel every
+ *   frame — read fresh each time a new wave is scheduled (see below), so an
+ *   interrupted wave (a second move landing before the first one finishes)
+ *   restarts from wherever the square visually was, not from a stale target
+ *   or a hard pop.
+ * - `oldValue`/`newValue` are the two ends of the current wave for that
+ *   square; `startTime` is when (on the local clock) that square's wave is
+ *   scheduled to begin, already carrying its distance-from-origin stagger
+ *   and, for a dramatic enemy reveal, the extra thicken hold.
+ * - `revealTime` mirrors `startTime` but only for reveals (isVisible target
+ *   1), and survives past the wave's own completion — it's what the shader's
+ *   G-channel turbulence pulse reads (see densityAndShapeGLSL).
+ */
+function useWaveState() {
+  return useRef({
+    effective: new Float32Array(64),
+    oldValue: new Float32Array(64),
+    newValue: new Float32Array(64),
+    startTime: new Float32Array(64),
+    revealTime: new Float32Array(64).fill(-999),
+    prevVisible: new Set(),
+    clock: 0,
+  });
+}
+
+export default function FogShader({ visibility, lastMove = null, enemyPieceSquares = null }) {
+  const wave = useWaveState();
 
   const { mask, layers, edgeMultiply } = useMemo(() => {
-    const data = new Float32Array(64); // 1 = visible, 0 = fogged
-    const texture = new THREE.DataTexture(data, 8, 8, THREE.RedFormat, THREE.FloatType);
+    const data = new Float32Array(64 * 2); // [r, g] per texel: r = eased visibility, g = reveal time
+    data.fill(-999);
+    for (let i = 0; i < 64; i++) data[i * 2] = 0; // start fully fogged
+    const texture = new THREE.DataTexture(data, 8, 8, THREE.RGFormat, THREE.FloatType);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
     texture.wrapS = THREE.ClampToEdgeWrapping;
@@ -386,27 +439,89 @@ export default function FogShader({ visibility }) {
   useEffect(() => {
     if (typeof window === 'undefined' || !window.location.search.includes('debug')) return;
     window.__fogMaterials = { layers, edgeMultiply, mask };
-  }, [layers, edgeMultiply, mask]);
+    window.__fogWave = wave;
+  }, [layers, edgeMultiply, mask, wave]);
 
-  useFrame((_, delta) => {
+  /*
+   * Schedules a new wave whenever the *content* of `visibility` actually
+   * changes — not on every render (GameCanvas recomputes `visibility` fresh
+   * every render, including hover/select changes that never touch game
+   * state, so a reference check alone would refire this constantly for no
+   * reason). Since visibility is a pure function of piece positions, a real
+   * content change only ever happens alongside a move — which is exactly
+   * when `lastMove` is fresh too.
+   *
+   * Reveal and conceal get different origins on purpose: a square becomes
+   * visible because a piece just arrived somewhere with a new sightline
+   * (`lastMove.to`), and a square goes dark because a piece just left the
+   * square that used to see it (`lastMove.from`) — so "you retreat, and the
+   * darkness follows" falls out of using the vacated square as the close-in
+   * wave's own origin, not a separate nearest-visible-square search.
+   */
+  useEffect(() => {
+    const w = wave.current;
+    const prev = w.prevVisible;
+    let changed = prev.size !== visibility.size;
+    if (!changed) {
+      for (const sq of visibility) {
+        if (!prev.has(sq)) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return;
+
+    const now = w.clock;
+    const revealOrigin = lastMove?.to ?? null;
+    const concealOrigin = lastMove?.from ?? revealOrigin;
+
     for (let i = 0; i < 64; i++) {
-      target.current[squareToMaskIndex(ALL_SQUARES[i])] = visibility.has(ALL_SQUARES[i]) ? 1 : 0;
+      const square = ALL_SQUARES[i];
+      const idx = squareToMaskIndex(square);
+      const wasVisible = prev.has(square);
+      const isVisible = visibility.has(square);
+      if (wasVisible === isVisible) continue;
+
+      const origin = isVisible ? revealOrigin : concealOrigin;
+      let delay = origin ? squareChebyshevDistance(square, origin) * FOG_WAVE_DELAY_PER_CELL : 0;
+      if (isVisible && enemyPieceSquares?.has(square)) delay += FOG_REVEAL_THICKEN_DURATION;
+
+      // Continue from wherever the square currently, visually is — not from
+      // its last discrete target — so a wave interrupted mid-flight by a
+      // second quick move restarts smoothly instead of popping.
+      w.oldValue[idx] = w.effective[idx];
+      w.newValue[idx] = isVisible ? 1 : 0;
+      w.startTime[idx] = now + delay;
+      if (isVisible) w.revealTime[idx] = now + delay;
     }
 
+    w.prevVisible = new Set(visibility);
+  }, [visibility, lastMove, enemyPieceSquares, wave]);
+
+  useFrame((_, delta) => {
+    const w = wave.current;
+    w.clock += delta;
+    const now = w.clock;
+
     const data = mask.image.data;
-    // Clamp the step so a long frame (tab regain, first paint) can't overshoot
-    // past the target and pop.
-    const step = Math.min(delta * FOG_LERP_SPEED, 1);
     for (let i = 0; i < 64; i++) {
-      current.current[i] += (target.current[i] - current.current[i]) * step;
-      data[i] = current.current[i];
+      const t =
+        FOG_WAVE_DURATION > 0
+          ? Math.min(1, Math.max(0, (now - w.startTime[i]) / FOG_WAVE_DURATION))
+          : 1;
+      const eased = easeOutCubic(t);
+      const value = w.oldValue[i] + (w.newValue[i] - w.oldValue[i]) * eased;
+      w.effective[i] = value;
+      data[i * 2] = value;
+      data[i * 2 + 1] = w.revealTime[i];
     }
     mask.needsUpdate = true;
 
     layers.forEach((l) => {
-      l.material.uniforms.uTime.value += delta;
+      l.material.uniforms.uTime.value = now;
     });
-    edgeMultiply.uniforms.uTime.value += delta;
+    edgeMultiply.uniforms.uTime.value = now;
   });
 
   return (

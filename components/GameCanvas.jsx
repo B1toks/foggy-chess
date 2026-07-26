@@ -219,6 +219,19 @@ export default function GameCanvas() {
   const canInteract =
     phase === 'playing' && turn === PLAYER_COLOR && status !== 'checkmate' && status !== 'draw';
 
+  // Крок 10, Section C: the same "what just happened" pair feeds both the
+  // fog's dispersal wave (Fog) and the enemy-piece reveal fade (Pieces), so
+  // they read as one event instead of two components independently guessing
+  // at timing. lastMove is null before any move exists (game start/reset),
+  // which both consumers treat as "no wave origin, just settle in place."
+  const lastMove = history.length ? history[history.length - 1] : null;
+  const enemyPieceSquares = new Set();
+  for (const row of board) {
+    for (const cell of row) {
+      if (cell && cell.color !== PLAYER_COLOR) enemyPieceSquares.add(cell.square);
+    }
+  }
+
   return (
     <div style={{ position: 'fixed', inset: 0, background: SKY_GRADIENT }}>
       {/* Negative Z is White's side of the board (rank 1 sits at z = -3.5), and
@@ -261,7 +274,7 @@ export default function GameCanvas() {
         <Pieces
           board={board}
           visibility={visibility}
-          lastMove={history.length ? history[history.length - 1] : null}
+          lastMove={lastMove}
           historyLength={history.length}
           selectedSquare={phase === 'playing' ? selectedSquare : null}
           hoveredSquare={phase === 'playing' ? hoveredSquare : null}
@@ -291,7 +304,7 @@ export default function GameCanvas() {
           color="#2A241C"
         />
 
-        <Fog visibility={visibility} />
+        <Fog visibility={visibility} lastMove={lastMove} enemyPieceSquares={enemyPieceSquares} />
 
         {phase === 'playing' ? (
           <>

@@ -413,7 +413,7 @@ components/DevPieceRow.jsx — dev-only side-on comparison row + measurement pro
 components/FogLayer.jsx    — 64 persistent fog planes, opacity lerped imperatively in useFrame (never via React state)
 components/HUD.jsx         — plain DOM overlay (turn/status, sound + new-game corner, control hint), absolutely positioned over the canvas
 lib/coords.js              — squareToWorld/worldToSquare, board centered at origin, a1 at the corner, 1 unit/cell
-lib/easing.js              — easeInOutCubic, shared by the intro camera and the board's move animation
+lib/easing.js              — easeInOutCubic (intro camera + board move), easeOutCubic (fog wave + piece reveal, Крок 10 Section C)
 lib/pieces.js              — PIECE_CONFIG (model path + targetHeight) and CODE_TO_PIECE ('n' -> 'knight')
 lib/useChessGame.js        — chess.js wrapper hook; isPromotion(); owns the AI-move effect (setTimeout keyed off turn/status)
 lib/visibility.js          — computeVisibility(game, color) -> Set<string>; unit-tested (lib/visibility.test.js)
@@ -573,6 +573,77 @@ never fogged, and enemy pieces inside fog are not rendered at all.
 Move-highlights sit at `HIGHLIGHT_HEIGHT` — now above the *tallest* fog layer
 (0.34 + 0.02) rather than a fixed 0.07 — so legal-move markers stay crisp on
 squares you have not explored, even through the raised silhouette layers.
+
+**Крок 10, Section C made a move an event instead of an instant mask swap.**
+The mask `DataTexture` grew a second channel (`THREE.RGFormat`, not `RedFormat`
+— R stays "current eased visibility", G is "when this square's reveal wave was
+scheduled to start"). The old CPU-side exponential lerp (`FOG_LERP_SPEED`) is
+gone from `FogShader.jsx` entirely, replaced by a per-square wave that
+`useFrame` writes into R every frame:
+
+```
+t = clamp((now - startTime[square]) / FOG_WAVE_DURATION, 0, 1)
+R[square] = mix(oldValue[square], newValue[square], easeOutCubic(t))
+```
+
+`startTime` is computed once, in a `visibility`-content-diffing `useEffect`
+(NOT a reference check — `GameCanvas` recomputes `visibility` fresh every
+render, including hover/select changes that never touch game state, so a
+naive `[visibility]` dependency would refire constantly for no reason; the
+effect diffs Set *contents* against a `prevVisible` ref and only schedules a
+new wave when a square's target state actually flipped):
+
+```
+delay = squareChebyshevDistance(square, origin) * FOG_WAVE_DELAY_PER_CELL
+      + (revealing && enemyPieceSquares.has(square) ? FOG_REVEAL_THICKEN_DURATION : 0)
+startTime[square] = now + delay
+```
+
+**Reveal and conceal use different origins on purpose** — `revealOrigin =
+lastMove.to`, `concealOrigin = lastMove.from`. A square becomes visible
+because a piece just arrived somewhere with a new sightline; a square goes
+dark because a piece just left the square that used to see it. "You retreat,
+and the darkness follows" falls out of using the vacated square as the
+close-in wave's own origin — no separate nearest-visible-square search needed.
+Verified empirically (`squareChebyshevDistance` + the formula above, read
+directly off `window.__fogWave.current.startTime` mid-scheduling): a queen
+move that opened one file and closed another produced exactly the predicted
+per-square delay, matched to floating-point precision, for every affected
+square in both directions simultaneously.
+
+**A wave, once scheduled, restarts from the square's current *effective*
+value, not its last discrete target.** `oldValue[square] = effective[square]`
+(the live, already-blended value) rather than `0`/`1` — a second move landing
+before the first wave finishes retargets smoothly instead of popping.
+
+**The enemy-piece reveal drama is `FOG_REVEAL_THICKEN_DURATION` (0.2s) added
+on top of the distance delay, nothing more exotic.** A square that's both
+newly visible and holds a black piece just holds its old (fogged) value
+longer before the same dispersal wave starts — thicken-then-burst falls out
+of one extra term in the delay formula, not a separate animation. The G
+channel (`revealTime`) is separate from this: it drives a small, bounded,
+decaying turbulence pulse in the shader
+(`exp(-abs(uTime - revealTime) * 3.0)`, folded into the wisp noise's
+amplitude only — never `ownVisible`/`density` directly) so the frontier
+visibly "boils" right as a wave passes through a square, on top of the alpha
+motion the CPU-side blend already provides. This is a flourish, not a second
+source of readability — the core open/close mechanic is fully carried by the
+R-channel blend and needs no shader-side timing at all.
+
+**`Pieces.jsx` computes the *same* delay formula independently** (own
+`squareChebyshevDistance` + `lastMove.to`, always with the thicken duration
+since any freshly-mounted non-white piece is by construction a reveal — see
+`AnimatedPieceGroup`'s `revealDelay` prop) rather than reading fog's own
+state, so the piece and the fog it emerges from read as one event without the
+two components sharing a ref. It relies on an enemy piece's first mount
+*already being* its reveal (`Pieces` returns `null` for an invisible enemy
+instance, so React actually unmounts/remounts the component on each
+visibility transition — true before Section C existed, just newly load-
+bearing) — `revealFade` is captured once via a `useRef` lazy initializer
+specifically so it can never flip mid-life for one mounted instance. The fade
+itself reuses `PieceModel`'s existing `fade` prop (clones BONE/LACQUER
+per-instance so opacity can animate without touching every piece of that
+colour) — the same mechanism `CaptureGhost` already used for fade-*out*.
 
 Mask orientation is easy to get subtly wrong (mirrored/transposed) and hard to
 spot on a symmetric start position. `/dev-fog?visible=a1` renders top-down
@@ -1186,6 +1257,16 @@ the entire reason the intro doesn't cost a second load.
   the fastest way to get a large, clean area of deep fog to inspect the wisp
   shader's actual structure rather than guessing from the ~24-square starting
   position.
+- `?debug=1` also exposes `window.__fogMaterials` (`{ layers, edgeMultiply,
+  mask }`, live `THREE.ShaderMaterial`/`DataTexture` refs) and
+  `window.__fogWave` (the Крок 10 Section C wave-state ref: `effective`/
+  `oldValue`/`newValue`/`startTime`/`revealTime` `Float32Array(64)`s, indexed
+  by `squareToMaskIndex`, plus `clock`). Reading `__fogWave.current` directly
+  is how the wave's per-square delay formula got verified to floating-point
+  precision — screenshot pixel-timing is unreliable for this (see "Headless
+  browser" below): a single simulated frame's `delta` can be large enough to
+  finish an entire 0.8s wave in one tick, so the *data*, not a mid-animation
+  screenshot, is the thing to read.
 
 ## Headless browser: the scene runs at ~1 fps
 
