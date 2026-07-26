@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { isAudioEnabled, setAudioEnabled } from './audio';
+import { GAME_OVER_STATUSES } from '../lib/useChessGame';
 
 // Flip to true (or append ?debug=1) to bring back the vision readout.
 const SHOW_DEBUG = false;
@@ -186,17 +187,26 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug'));
 
   const turnLabel = turn === 'w' ? 'White (you)' : 'Black (AI)';
-  const isOver = status === 'checkmate' || status === 'draw';
+  const isOver = GAME_OVER_STATUSES.includes(status);
 
   // Check is deliberately not surfaced anywhere in the HUD — see the
   // StatusFlash comment below for why: telling the player their king is
   // under attack is exactly the kind of information the fog is supposed to
   // withhold when the attacker itself is unseen.
+  //
+  // Крок 14: a captured king is a real, immediate end to the game (see
+  // lib/kingCapture.js) — the same "the game has genuinely ended, nothing
+  // left to withhold" reasoning that already applies to checkmate, so it
+  // gets the same corner-message + StatusFlash treatment below.
   let message;
   if (status === 'checkmate') {
     // chess.js leaves `turn` on the side that has been mated.
     const winner = turn === 'w' ? 'Black (AI)' : 'White (you)';
     message = `Checkmate — ${winner} wins`;
+  } else if (status === 'whiteKingCaptured') {
+    message = 'White’s king was captured — Black (AI) wins';
+  } else if (status === 'blackKingCaptured') {
+    message = 'Black’s king was captured — White (you) wins';
   } else if (status === 'draw') {
     message = 'Draw';
   } else {
@@ -267,6 +277,9 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
           </div>
 
           {status === 'checkmate' && <StatusFlash text="Checkmate" />}
+          {(status === 'whiteKingCaptured' || status === 'blackKingCaptured') && (
+            <StatusFlash text="King Captured" />
+          )}
         </>
       )}
     </>

@@ -135,6 +135,51 @@ const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
 const ROCK_SCALE_Y = 7.277;
 const ROCK_Y_OFFSET = Y - ROCK_FLOOR_Y_RAW * ROCK_SCALE_Y;
 
+/*
+ * Крок 14: a smooth, uniform platform directly under the board.
+ *
+ * The rock's flat basin floor (ROCK_FIT_HALF_WIDTH above) is one continuous
+ * mesh sharing the baked granite/pine material everywhere — there is no
+ * surface distinct from the rest of the formation right where the board
+ * actually sits, so a thin sliver of textured, faceted rock showed at the
+ * board's own edge. This sits on top of that floor, flush with the board's
+ * resting height (Y), with a plain material carrying no baked maps at all —
+ * that absence of texture is the point, a deliberately worked/polished patch
+ * against the raw stone around it.
+ *
+ * A box, not a circle: the board's own footprint is square (Board.jsx's slab
+ * is a boxGeometry), and TemporaryPedestal's circular disc below is sized to
+ * be "a little wider than the board" for a fallback ground plane, not to
+ * hug a square's corners — at PEDESTAL_RADIUS a circle doesn't even reach
+ * the square footprint's own corners (half-diagonal BOARD_HALF_WIDTH*sqrt(2)
+ * is bigger than PEDESTAL_RADIUS). A box avoids that gap entirely.
+ */
+export const SHOW_BOARD_PLATFORM = true;
+const PLATFORM_HALF_WIDTH = BOARD_HALF_WIDTH * 1.06;
+const PLATFORM_THICKNESS = 0.02;
+// The rock's own flat basin floor sits at EXACTLY y = Y (RockModel's scale/
+// offset is solved so ROCK_FLOOR_Y_RAW * ROCK_SCALE_Y + ROCK_Y_OFFSET = Y) —
+// a platform top face placed at that same Y would be coplanar with the rock's
+// own surface there and z-fight with it. Lifted a couple millimeters proud of
+// it instead, comfortably clear of the board slab's own bottom (~Y + 0.005
+// per the "board slab spans y -0.31..-0.01" note above) so it never pokes
+// into the board either.
+const PLATFORM_TOP_Y = Y + 0.003;
+// A quiet warm grey sitting between the rock's own tint (#B9B4A8) and the
+// board frame's near-black (#2A241C) — smoother (lower roughness) than the
+// surrounding granite so it reads as worked stone, not more raw rock.
+const PLATFORM_COLOR = '#8C8577';
+const PLATFORM_ROUGHNESS = 0.4;
+
+function BoardPlatform() {
+  return (
+    <mesh position={[0, PLATFORM_TOP_Y - PLATFORM_THICKNESS / 2, 0]} receiveShadow>
+      <boxGeometry args={[PLATFORM_HALF_WIDTH * 2, PLATFORM_THICKNESS, PLATFORM_HALF_WIDTH * 2]} />
+      <meshStandardMaterial color={PLATFORM_COLOR} roughness={PLATFORM_ROUGHNESS} metalness={0} />
+    </mesh>
+  );
+}
+
 /**
  * Stand-in while ROCK_MODEL doesn't exist: a flat, sharp-edged disc (no rim
  * fade — the brief wants this to read as an honest pedestal, not a second
@@ -194,5 +239,10 @@ function RockModel() {
 
 export default function RockIsland() {
   if (!SHOW_ROCK_ISLAND) return null;
-  return ROCK_MODEL ? <RockModel /> : <TemporaryPedestal />;
+  return (
+    <>
+      {ROCK_MODEL ? <RockModel /> : <TemporaryPedestal />}
+      {SHOW_BOARD_PLATFORM && <BoardPlatform />}
+    </>
+  );
 }

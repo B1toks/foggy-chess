@@ -1,4 +1,16 @@
+import { useMemo } from 'react';
 import { Environment } from '@react-three/drei';
+
+// Крок 14: narrow-viewport/coarse-pointer devices get a smaller shadow-map
+// render target — one more step down from Крок 11, Section A3's 1024, for
+// that tier only. Same matchMedia check as GameCanvas.jsx's isLowPowerDevice
+// and FogShader.jsx's marchStepsForDevice; duplicated locally rather than
+// shared, matching this codebase's convention of a small local read-once
+// tuning helper per file (see tuningFromUrl/readTuning elsewhere).
+function isLowPowerDevice() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+}
 
 /*
  * Chosen by side-by-side comparison on /dev-pieces?focus=1&env=<preset>:
@@ -42,6 +54,7 @@ export default function Lighting({ preset, envIntensity = ENV_INTENSITY }) {
   // `preset` is only passed by the dev comparison page; the game always uses
   // the self-hosted file.
   const envProps = preset ? { preset } : { files: ENV_FILE };
+  const shadowMapSize = useMemo(() => (isLowPowerDevice() ? 512 : 1024), []);
 
   return (
     <>
@@ -59,12 +72,14 @@ export default function Lighting({ preset, envIntensity = ENV_INTENSITY }) {
           own render-target cost. Board/pieces are close-range and small
           (shadow-camera bounds are +/-6 units), so 1024 still resolves
           crisp piece-base contact shadows; verify by eye if a future piece
-          set adds finer detail near the shadow's own resolution limit. */}
+          set adds finer detail near the shadow's own resolution limit.
+          Крок 14: drops to 512 on the mobile/low-power tier — see
+          isLowPowerDevice() above. */}
       <directionalLight
         position={[4, 6, 3]}
         intensity={0.85}
         castShadow
-        shadow-mapSize={[1024, 1024]}
+        shadow-mapSize={[shadowMapSize, shadowMapSize]}
         shadow-camera-left={-6}
         shadow-camera-right={6}
         shadow-camera-top={6}

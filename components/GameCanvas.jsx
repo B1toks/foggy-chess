@@ -4,7 +4,7 @@ import { Canvas, useThree } from '@react-three/fiber';
 import { ContactShadows, OrbitControls } from '@react-three/drei';
 import CameraRig from './CameraRig';
 import IntroCameraRig, { INTRO_START_POSITION } from './IntroCameraRig';
-import { useChessGame } from '../lib/useChessGame';
+import { GAME_OVER_STATUSES, useChessGame } from '../lib/useChessGame';
 import { computeVisibility } from '../lib/visibility';
 import { ALL_SQUARES, squaresBetween } from '../lib/fog';
 import Board from './Board';
@@ -154,6 +154,17 @@ function initialFenFromUrl() {
   return new URLSearchParams(window.location.search).get('fen') ?? undefined;
 }
 
+// Крок 14: narrow-viewport/coarse-pointer devices skip the 1.5x devicePixelRatio
+// headroom entirely — on a phone that's pure overdraw the player is unlikely to
+// resolve at normal viewing distance, and it stacks with the other Крок 14 mobile
+// levers (FogShader.jsx's marchStepsForDevice, Lighting.jsx's shadow-mapSize) to
+// bring the two costliest additions from Крок 12/13 back down for that tier only
+// — desktop keeps the full [1, 1.5] tuned in Крок 11, Section A3.
+function isLowPowerDevice() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+}
+
 // Tuning hooks: ?envi= and ?exp= override environment intensity and tone
 // mapping exposure so the light balance can be swept without a rebuild.
 function tuningFromUrl() {
@@ -195,6 +206,9 @@ export default function GameCanvas() {
   const tuningRef = useRef(null);
   if (tuningRef.current === null) tuningRef.current = tuningFromUrl();
   const tuning = tuningRef.current;
+  const lowPowerRef = useRef(null);
+  if (lowPowerRef.current === null) lowPowerRef.current = isLowPowerDevice();
+  const lowPower = lowPowerRef.current;
 
   // Крок 8, Section C: lifted out of Board so Pieces can lift the hovered/
   // selected piece. Board still owns the pointer handlers and click logic —
@@ -265,7 +279,7 @@ export default function GameCanvas() {
   const fogVisibility =
     showFog && flightClearSquares.size ? new Set([...visibility, ...flightClearSquares]) : visibility;
   const canInteract =
-    phase === 'playing' && turn === PLAYER_COLOR && status !== 'checkmate' && status !== 'draw';
+    phase === 'playing' && turn === PLAYER_COLOR && !GAME_OVER_STATUSES.includes(status);
 
   // Крок 10, Section C: the same "what just happened" pair feeds both the
   // fog's dispersal wave (Fog) and the enemy-piece reveal fade (Pieces), so
@@ -297,7 +311,9 @@ export default function GameCanvas() {
         // 1.5 still reads noticeably sharper than 1x on a Retina-class
         // screen, just not the full (and mostly wasted, past normal viewing
         // distance) native density.
-        dpr={[1, 1.5]}
+        // Крок 14: the mobile/low-power tier drops the 1.5x headroom entirely
+        // — see isLowPowerDevice() above.
+        dpr={lowPower ? [1, 1] : [1, 1.5]}
         gl={{ alpha: true, toneMapping: TONE_MAPPING, powerPreference: 'high-performance', antialias: true }}
         onCreated={({ gl }) => {
           gl.toneMappingExposure = tuning.exposure ?? EXPOSURE;

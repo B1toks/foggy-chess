@@ -1,3 +1,4 @@
+import Head from 'next/head';
 import { Zen_Old_Mincho, Inter } from 'next/font/google';
 import '../styles/globals.css';
 
@@ -20,8 +21,19 @@ const ui = Inter({
 
 export default function App({ Component, pageProps }) {
   return (
-    <div className={`${display.variable} ${ui.variable}`}>
-      <Component {...pageProps} />
-    </div>
+    <>
+      {/* Крок 14: moved here from pages/_document.js's <Head> — Next 15 warns
+          that a viewport meta tag in _document.js's Head "should not be
+          used" (it's the server-only shell, not reconciled per-navigation),
+          and this project actually needs it to take effect on real mobile
+          browsers, not just silence the warning. next/head's Head is the
+          per-page-tree one that does. */}
+      <Head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      </Head>
+      <div className={`${display.variable} ${ui.variable}`}>
+        <Component {...pageProps} />
+      </div>
+    </>
   );
 }

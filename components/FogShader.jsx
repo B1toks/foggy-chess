@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
+import { useFBO } from '@react-three/drei';
 import * as THREE from 'three';
 import {
   ALL_SQUARES,
@@ -81,6 +82,65 @@ import { getFogNoiseTexture } from './proceduralTextures';
  */
 
 /*
+ * Крок 14: pieces are opaque geometry standing INSIDE the fog volume, and
+ * this shader was blind to them. Both `tGround` (the occlusion guarantee's
+ * own square lookup) and the raymarch itself were computed by extending the
+ * camera ray all the way to the slab's base plane, as if nothing solid were
+ * in the way — correct for empty air, wrong the instant a piece's body
+ * sits between the camera and that base-plane point.
+ *
+ * Concretely: for a camera ray through a point partway up a piece (any
+ * height below the slab's own top, FOG_HEIGHT + FOG_SLAB_HEIGHT — which is
+ * most of every piece's body, since only the tips of king/queen/bishop poke
+ * above it), continuing that same ray on to the base plane travels well
+ * PAST the piece — often landing on a square a full rank or more beyond it
+ * (the exact distance grows with piece height and shrinks with camera
+ * pitch; a straight-line calc for a resting-camera view of a king put it a
+ * full rank away, e2 instead of e1). If that farther square is fogged, the
+ * shader painted fog across the piece itself, even though the piece's own
+ * square was never fogged — reported as "fog jumps in front of and covers a
+ * piece," this time for a piece just standing still, not just Крок 13's
+ * moving-piece case (squaresBetween in lib/fog.js), which this supersedes
+ * for the general case: that fix only ever exempted squares along one
+ * piece's own straight-line move, and did nothing for every other piece
+ * sitting on the board, nor for a diagonal parallax drift that doesn't
+ * follow the move's own line.
+ *
+ * The fix is a small, cheap scene-depth prepass (`useSceneDepth` below),
+ * the same technique — and, on this exact codebase, the same COST class —
+ * ContactShadows already pays every frame for its own depth pass. The fog
+ * mesh hides itself for that one render (see `meshRef`/`visible` in the
+ * component) so it isn't shading itself into its own occlusion input, and
+ * isn't costing its own march twice over.
+ *
+ * The shader reconstructs the world position of whatever opaque surface the
+ * depth texture recorded at this pixel (`worldPosFromDepth`) and turns it
+ * into `dOpaque` — a distance along the SAME ray `t` already parameterises,
+ * because `rd` is unit length and `t` is already Euclidean distance from
+ * `cameraPosition`, so the two are directly comparable with no unit
+ * conversion. Both the ground-hit search and the march's own upper bound
+ * are then clamped to `dOpaque`:
+ *
+ * - If nothing opaque is nearer than the base plane, `dOpaque` is huge and
+ *   every existing computation is untouched.
+ * - If a piece IS nearer, the ground hit collapses onto the piece's own
+ *   surface point instead of overshooting past it — `boardUv` of that point
+ *   resolves to the square the piece is actually standing on, which is
+ *   always either White's own (always visible) or a currently-visible enemy
+ *   piece, so `baseAlpha` there is correctly ~0 by construction rather than
+ *   by coincidence.
+ * - The march's own far bound is clamped the same way, so cloud samples
+ *   that would have landed behind the piece (from the camera's point of
+ *   view) never get composited in front of it either — the volumetric term
+ *   had the identical blind spot and needed the identical fix.
+ *
+ * This does NOT touch the occlusion-guarantee invariant above: it can only
+ * ever make baseAlpha/volAlpha smaller at a pixel where fog previously
+ * over-painted an opaque piece, never larger over a genuinely empty fogged
+ * square (dOpaque there sits at the far clip plane, clamping nothing).
+ */
+
+/*
  * The box is axis-aligned in world space and never rotated or scaled, so the
  * fragment shader can do its ray-box intersection directly in WORLD coordinates
  * against two constant corners. That is deliberate: GLSL ES 1.0 has no
@@ -150,7 +210,7 @@ function sharedUniformsAndNoiseGLSL() {
  * Everything is templated in as GLSL literals from lib/fog.js, the same way the
  * slice code was, and the march is a fixed, fully-unrollable loop count.
  */
-function fragmentShaderSource() {
+function fragmentShaderSource(marchSteps = FOG_MARCH_STEPS) {
   const slabTop = FOG_HEIGHT + FOG_SLAB_HEIGHT;
   const slabHalf = 4 + FOG_SLAB_OVERHANG;
 
@@ -160,6 +220,27 @@ function fragmentShaderSource() {
     uniform vec3 uColorLit;
     uniform vec3 uTint;
     uniform vec2 uLightUv;
+
+    // Крок 14: scene depth prepass (see the file-level comment above
+    // fragmentShaderSource) — lets this shader tell a piece's own opaque
+    // surface apart from the empty air its ray-to-the-base-plane math
+    // otherwise assumes.
+    uniform sampler2D uSceneDepth;
+    uniform vec2 uResolution;
+    uniform mat4 uProjectionMatrixInverse;
+    uniform mat4 uViewMatrixInverse;
+
+    // Reconstructs the world position the depth prepass recorded at this
+    // screen pixel. Standard NDC -> view -> world unprojection; WebGL's clip
+    // space z is [-1, 1], and the depth texture stores [0, 1], hence the
+    // "* 2.0 - 1.0" remap below.
+    vec3 worldPosFromDepth(vec2 screenUv, float depth) {
+      vec4 ndc = vec4(screenUv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+      vec4 viewSpace = uProjectionMatrixInverse * ndc;
+      viewSpace /= viewSpace.w;
+      vec4 worldSpace = uViewMatrixInverse * viewSpace;
+      return worldSpace.xyz;
+    }
 
     // Constant world-space bounds of the fog slab. The mesh is never rotated or
     // scaled, so these are literals rather than uniforms. The XZ bounds are the
@@ -224,6 +305,19 @@ function fragmentShaderSource() {
       t0 = max(t0, 0.0);
 
       /*
+       * Крок 14: how far along THIS ray an opaque piece (or the board/rock
+       * beneath it) actually sits, from the scene depth prepass. Left huge
+       * when the prepass saw nothing there (background/sky), so every line
+       * below is a no-op in the common case where nothing occludes.
+       */
+      float sceneDepthRaw = texture2D(uSceneDepth, gl_FragCoord.xy / uResolution).x;
+      float dOpaque = 1.0e6;
+      if (sceneDepthRaw < 0.9999) {
+        vec3 opaqueWorldPos = worldPosFromDepth(gl_FragCoord.xy / uResolution, sceneDepthRaw);
+        dOpaque = distance(ro, opaqueWorldPos);
+      }
+
+      /*
        * GROUND UV: where the view ray crosses the slab's BASE plane. That is the
        * square the player is actually looking at through the fog, and it is what
        * the occlusion guarantee below is computed from — the same quantity the
@@ -234,9 +328,19 @@ function fragmentShaderSource() {
        * the base plane; there is no such square then, so the exit point is used
        * instead. That is what makes a fog bank seen edge-on still belong to the
        * fogged region behind it rather than reading as unfogged.
+       *
+       * Крок 14: clamped to dOpaque first. Without this, a piece standing
+       * between the camera and its own square's base-plane point never
+       * factors in here at all — the ray just keeps going past the piece to
+       * whatever square sits behind it, which is how fog ended up painted
+       * over pieces that were standing on a perfectly clear square of their
+       * own. Clamping collapses the ground hit onto the piece's own surface,
+       * so boardUv below resolves to the piece's actual square instead.
        */
       float tGround = abs(rd.y) > 1e-5 ? (BOX_MIN.y - ro.y) / rd.y : -1.0;
-      vec3 groundHit = ro + rd * (tGround > t0 && tGround <= t1 ? tGround : t1);
+      float tGroundRaw = tGround > t0 && tGround <= t1 ? tGround : t1;
+      float tGroundHit = min(tGroundRaw, dOpaque);
+      vec3 groundHit = ro + rd * tGroundHit;
       vec2 groundUv = clamp(boardUv(groundHit), vec2(0.0), vec2(1.0));
 
       /*
@@ -341,7 +445,7 @@ function fragmentShaderSource() {
        * as thick from the side and thin from above.
        */
       float span = t1 - t0;
-      float stepLen = span / float(${FOG_MARCH_STEPS});
+      float stepLen = span / float(${marchSteps});
       // Half-step offset so samples sit at segment centres, plus a small
       // screen-space jitter: a fixed 10-step march otherwise shows its sample
       // planes as concentric shells across the slab. Kept low (0.35, not the 0.6
@@ -353,7 +457,13 @@ function fragmentShaderSource() {
       vec3 volColor = vec3(0.0);
       float trans = 1.0;
 
-      for (int i = 0; i < ${FOG_MARCH_STEPS}; i++) {
+      for (int i = 0; i < ${marchSteps}; i++) {
+        // Крок 14: stop marching once the ray reaches whatever opaque surface
+        // the depth prepass found — samples beyond it are, from the camera's
+        // point of view, behind a piece (or the board/rock), and compositing
+        // them in front of it is the volumetric half of the same bug the
+        // ground-hit clamp above fixes for the occlusion guarantee.
+        if (t > dOpaque) break;
         vec3 p = ro + rd * t;
         t += stepLen;
 
@@ -446,7 +556,37 @@ function fragmentShaderSource() {
   `;
 }
 
-function makeFogMaterial(mask, noiseTex) {
+// Крок 14: narrow-viewport/coarse-pointer devices get a cheaper march — the
+// loop count is templated straight into the GLSL source (see
+// fragmentShaderSource above), so it has to be decided before the material is
+// built, not tuned afterward via a uniform. Read once, like every other
+// tuning hook in this codebase (tuningFromUrl in GameCanvas.jsx, readTuning
+// in Backdrop.jsx, etc).
+const FOG_MARCH_STEPS_MOBILE = 10;
+function marchStepsForDevice() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return FOG_MARCH_STEPS;
+  }
+  const isLowPower = window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+  return isLowPower ? FOG_MARCH_STEPS_MOBILE : FOG_MARCH_STEPS;
+}
+
+// Крок 14: resolution of the scene-depth prepass (see useSceneDepth below).
+// This only needs to tell "is a piece here" apart from "empty air" — nowhere
+// near display resolution — so it's a fixed, small size rather than scaled
+// off canvas/dpr like the main render. Mobile gets the smaller of the two for
+// the same reason marchStepsForDevice does.
+const SCENE_DEPTH_SIZE = 512;
+const SCENE_DEPTH_SIZE_MOBILE = 256;
+function sceneDepthSizeForDevice() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return SCENE_DEPTH_SIZE;
+  }
+  const isLowPower = window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+  return isLowPower ? SCENE_DEPTH_SIZE_MOBILE : SCENE_DEPTH_SIZE;
+}
+
+function makeFogMaterial(mask, noiseTex, marchSteps, sceneDepth) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uMask: { value: mask },
@@ -460,9 +600,18 @@ function makeFogMaterial(mask, noiseTex) {
       uLightUv: {
         value: new THREE.Vector2(FOG_LIGHT_UV[0], FOG_LIGHT_UV[1]).normalize(),
       },
+      // Крок 14: scene-depth prepass. The texture itself is set once, here
+      // (never null — the depth render target is created before this
+      // material is, same as mask/noiseTex above); uResolution/the inverse
+      // matrices are updated every frame in FogShader's useFrame, since they
+      // track the live camera and canvas size.
+      uSceneDepth: { value: sceneDepth },
+      uResolution: { value: new THREE.Vector2(1, 1) },
+      uProjectionMatrixInverse: { value: new THREE.Matrix4() },
+      uViewMatrixInverse: { value: new THREE.Matrix4() },
     },
     vertexShader: VERTEX_SHADER,
-    fragmentShader: fragmentShaderSource(),
+    fragmentShader: fragmentShaderSource(marchSteps),
     transparent: true,
     depthWrite: false,
     /*
@@ -515,6 +664,29 @@ function useWaveState() {
 
 export default function FogShader({ visibility, lastMove = null, enemyPieceSquares = null }) {
   const wave = useWaveState();
+  const meshRef = useRef(null);
+
+  // Крок 14: the scene-depth prepass (see the file-level comment above
+  // fragmentShaderSource). A small, fixed-size render target — this only
+  // has to distinguish "a piece/board/rock is here" from "empty air", not
+  // match display resolution.
+  const depthSizeRef = useRef(null);
+  if (depthSizeRef.current === null) depthSizeRef.current = sceneDepthSizeForDevice();
+  const depthTarget = useFBO(depthSizeRef.current, depthSizeRef.current, {
+    depth: true,
+    // The colour attachment is never sampled — only depthTexture is used
+    // below — so it's the cheapest type available rather than useFBO's own
+    // HalfFloat default.
+    type: THREE.UnsignedByteType,
+  });
+  useEffect(() => {
+    // Nearest, not the FBO default Linear: interpolating raw depth values
+    // across a piece's silhouette edge would blend near/far depths into a
+    // meaningless intermediate one right where precision matters most.
+    depthTarget.depthTexture.minFilter = THREE.NearestFilter;
+    depthTarget.depthTexture.magFilter = THREE.NearestFilter;
+    depthTarget.depthTexture.needsUpdate = true;
+  }, [depthTarget]);
 
   const { mask, material } = useMemo(() => {
     // RGBA now, not RG: A (r=eased visibility, g=reveal time) plus
@@ -536,7 +708,14 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
 
     const noiseTex = getFogNoiseTexture();
 
-    return { mask: texture, material: makeFogMaterial(texture, noiseTex) };
+    return {
+      mask: texture,
+      material: makeFogMaterial(texture, noiseTex, marchStepsForDevice(), depthTarget.depthTexture),
+    };
+    // depthTarget is stable for the component's lifetime (useFBO's own memo
+    // never recreates it from a resize, only target.setSize() mutates it in
+    // place), so it's deliberately not a dependency here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(
@@ -544,7 +723,8 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
       material.dispose();
       mask.dispose();
       // getFogNoiseTexture() is a shared module-level singleton (like
-      // getBoardRoughnessMap) — not disposed per-mount.
+      // getBoardRoughnessMap) — not disposed per-mount. depthTarget disposes
+      // itself (useFBO's own cleanup effect).
     },
     [material, mask],
   );
@@ -614,7 +794,7 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
     w.prevVisible = new Set(visibility);
   }, [visibility, lastMove, enemyPieceSquares, wave]);
 
-  useFrame((_, delta) => {
+  useFrame((state, delta) => {
     const w = wave.current;
     w.clock += delta;
     const now = w.clock;
@@ -635,6 +815,27 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
     mask.needsUpdate = true;
 
     material.uniforms.uTime.value = now;
+
+    /*
+     * Крок 14: the scene-depth prepass. Hide this own mesh first — it's
+     * transparent and depthWrite:false so it wouldn't corrupt the depth
+     * texture either way, but with it visible the (expensive) fog fragment
+     * shader would run a second time, for a frame whose colour output is
+     * immediately thrown away. Same trick ContactShadows already relies on
+     * for its own continuously-refreshed depth pass, applied to a mesh this
+     * component owns directly instead of a whole separate scene.
+     */
+    const mesh = meshRef.current;
+    if (mesh) mesh.visible = false;
+    state.gl.setRenderTarget(depthTarget);
+    state.gl.render(state.scene, state.camera);
+    state.gl.setRenderTarget(null);
+    if (mesh) mesh.visible = true;
+
+    const dpr = state.viewport.dpr;
+    material.uniforms.uResolution.value.set(state.size.width * dpr, state.size.height * dpr);
+    material.uniforms.uProjectionMatrixInverse.value.copy(state.camera.projectionMatrixInverse);
+    material.uniforms.uViewMatrixInverse.value.copy(state.camera.matrixWorld);
   });
 
   /*
@@ -654,7 +855,7 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
    */
   const slabWidth = 8 + FOG_SLAB_OVERHANG * 2;
   return (
-    <mesh position={[0, FOG_HEIGHT + FOG_SLAB_HEIGHT / 2, 0]} renderOrder={3}>
+    <mesh ref={meshRef} position={[0, FOG_HEIGHT + FOG_SLAB_HEIGHT / 2, 0]} renderOrder={3}>
       <boxGeometry args={[slabWidth, FOG_SLAB_HEIGHT, slabWidth]} />
       <primitive object={material} attach="material" />
     </mesh>

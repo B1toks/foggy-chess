@@ -1084,6 +1084,62 @@ starts rendering once its destination square is already visible, and it's
 fine for its arrival animation to flicker under fog along a path the player
 never had eyes on anyway.
 
+### Крок 14: a piece just standing still could get fogged too, not only a moving one
+
+The Крок 13 fix above only ever exempted squares along one piece's own
+straight-line *move* — it did nothing for a piece that was simply standing
+still elsewhere on the board, and the underlying bug is more general than
+"mid-flight": it's that `FogShader`'s ray-to-the-base-plane math has no idea
+an opaque piece's body is sitting between the camera and that base plane at
+all. For a camera ray through any point on a piece's body below the slab's
+own top (`FOG_HEIGHT + FOG_SLAB_HEIGHT`, ~1.12 — true for most of every
+piece, since only the tips of king/queen/bishop poke above it), continuing
+that ray on to the base plane sails straight past the piece and can land a
+full rank or more beyond it. If *that* square is fogged, the shader painted
+fog across the piece itself even though the piece's own square was never
+fogged. Worked out analytically for a resting-camera view of a king (camera
+`[3.5, 7, -8.5]`, king on e1): the unobstructed ray hit e2, one rank deeper,
+not e1 — and reproduced empirically with a lone knight on an otherwise-empty
+board (visibly fog-washed on `master`, clean after the fix; see git history
+for the A/B screenshots this was verified against).
+
+Squares-based exemption (Крок 13's fix) can't generalise to this — it would
+mean tracking a "shadow square" per piece per frame, re-derived every time
+the camera orbits (full 360°, unclamped azimuth), and rescheduling it through
+the reveal/conceal wave machinery would spam wave restarts on every camera
+tick. The fix instead gives `FogShader` a small scene-depth prepass (a
+`useFBO`-backed `DepthTexture`, resolution 512 desktop / 256 on the same
+low-power tier `marchStepsForDevice` already targets) rendered once a frame
+—same technique, and the same cost class, `ContactShadows` already pays for
+its own continuously-refreshed depth pass. The fog's own box mesh hides
+itself for that one render (cheap visibility toggle) so it isn't shading its
+own expensive march into a depth buffer nobody reads, and isn't polluting
+its own occlusion input.
+
+The fragment shader reconstructs the opaque surface's world position from
+that depth texture (`worldPosFromDepth`, standard NDC → view → world
+unprojection via `uProjectionMatrixInverse`/`uViewMatrixInverse`) and turns
+it into `dOpaque`, a distance directly comparable to the ray parameter `t`
+(both measured from `cameraPosition` along the same unit ray). Both the
+ground-hit search (`tGroundHit = min(tGroundRaw, dOpaque)`) and the march's
+own loop (`if (t > dOpaque) break;`) are clamped to it: when nothing opaque
+is nearer than the base plane, `dOpaque` sits far past the far clip and
+every existing computation is untouched; when a piece *is* nearer, the
+ground hit collapses onto the piece's own surface, so `boardUv` of that
+point resolves to the square the piece is actually standing on — which, by
+the game's own render rule, is always either White's own (always visible) or
+a currently-visible enemy piece, so `baseAlpha` comes out ~0 by construction.
+
+This does not touch the occlusion-guarantee invariant documented above
+`fragmentShaderSource` in `FogShader.jsx`: it can only ever make
+`baseAlpha`/`volAlpha` *smaller* at a pixel where fog was over-painting an
+opaque piece, never larger over a genuinely empty fogged square (`dOpaque`
+there is effectively infinite, so the clamp is a no-op). Verified with
+`tools/fogdiag.mjs` after the change: fogged-tile leak 2.17 luma mean / 4.50
+max (documented baseline 2.18 / 4.44 — unchanged within noise), clear-square
+light/dark delta 36.69 (baseline ~37.2) — the occlusion guarantee and tile
+readability both hold exactly as before, on top of the piece fix.
+
 ## Camera and environment
 
 The player is always White and rank 1 sits at z = -3.5, so the camera starts

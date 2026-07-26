@@ -47,13 +47,43 @@ const LACQUER = new THREE.MeshStandardMaterial({
  * raw-vs-finished gap.
  */
 const BONE = new THREE.MeshPhysicalMaterial({
-  color: '#DDD3BE',
+  color: '#a08c55',
   roughness: 0.58,
   metalness: 0,
   clearcoat: 0.8,
   clearcoatRoughness: 0.08,
   flatShading: true,
 });
+
+/*
+ * Крок 14 — EXPERIMENTAL. Black still reads as visually stronger than white
+ * even after the clearcoat pass above. This is a code-only knob, not a site
+ * feature: no HUD control, nothing in the intro, nothing documented as part
+ * of the game. `?bone=`/`?boneRough=`/`?boneMetal=`/`?boneClear=`/
+ * `?boneClearRough=` override BONE's properties in place for local sweeping
+ * only, the same `URLSearchParams`-read-once pattern every other tuning hook
+ * in this codebase already uses (see GameCanvas.jsx's `tuningFromUrl`,
+ * Backdrop.jsx's `readTuning`). Delete this block and the five `if`s below it
+ * to revert — nothing else in the file depends on it.
+ */
+function boneTuningFromUrl() {
+  if (typeof window === 'undefined') return {};
+  const q = new URLSearchParams(window.location.search);
+  const num = (k) => (q.has(k) ? Number(q.get(k)) : undefined);
+  return {
+    color: q.get('bone') ?? undefined,
+    roughness: num('boneRough'),
+    metalness: num('boneMetal'),
+    clearcoat: num('boneClear'),
+    clearcoatRoughness: num('boneClearRough'),
+  };
+}
+const BONE_OVERRIDE = boneTuningFromUrl();
+if (BONE_OVERRIDE.color) BONE.color = new THREE.Color(`#${BONE_OVERRIDE.color}`);
+if (BONE_OVERRIDE.roughness !== undefined) BONE.roughness = BONE_OVERRIDE.roughness;
+if (BONE_OVERRIDE.metalness !== undefined) BONE.metalness = BONE_OVERRIDE.metalness;
+if (BONE_OVERRIDE.clearcoat !== undefined) BONE.clearcoat = BONE_OVERRIDE.clearcoat;
+if (BONE_OVERRIDE.clearcoatRoughness !== undefined) BONE.clearcoatRoughness = BONE_OVERRIDE.clearcoatRoughness;
 
 function normalizeHeight(object3d, targetHeight) {
   const box = new THREE.Box3().setFromObject(object3d);
