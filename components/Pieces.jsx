@@ -17,7 +17,10 @@ const PLAYER_COLOR = 'w';
 // Крок 8, Section C: move/lift/fade tuning. All three read as "a piece is a
 // physical object, not a UI sprite" — a move arcs and takes a beat, a hover
 // lifts by a hair and settles back, a capture fades rather than vanishing.
-const MOVE_DURATION = 0.35;
+// Exported: GameCanvas.jsx reads it to know how long an own piece's flight
+// path should be exempted from the fog volume — see squaresBetween in
+// lib/fog.js for why that exemption exists.
+export const MOVE_DURATION = 0.35;
 const MOVE_ARC_HEIGHT = 0.32;
 const HOVER_LIFT = 0.03;
 const HOVER_LERP_SPEED = 10; // 1/e time constant-ish, per second

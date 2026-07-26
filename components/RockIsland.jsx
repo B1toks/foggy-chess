@@ -31,118 +31,109 @@ const Y = -0.315;
 const PEDESTAL_COLOR = '#241F19';
 
 /*
- * Крок 11, Section C: the model was one flat granite grey (#6E6A62) with
- * pine silhouettes growing off its sides, per the export's own name
- * ("granite-pine-aerie"). Inspecting the glTF JSON directly (its `meshes`/
- * `materials` arrays — no need for a full loader) confirmed there is
- * exactly one mesh and one material: `meshes[0].primitives` has a single
- * primitive, `material: 0`, and `materials` has one entry. So this is the
- * "все одним мешем" case the brief anticipated — a geometry-based mask in
- * a custom shader, not a second material swap.
+ * Крок 12, Section D: the rock wears Mint's own baked textures.
  *
- * The glTF's own POSITION accessor bounds (min/max, which the spec requires
- * to stay correct even under Draco compression) gave the raw model's local
- * extent directly, no runtime raycasting needed this time: X -0.946..0.949,
- * Y -0.851..0.852, Z -0.813..0.815. ROCK_MIN_Y/ROCK_HEIGHT/ROCK_MAX_RADIUS
- * below are those bounds — radius taken as the larger of the X/Z half-
- * extents, since the mask only needs "how far from the vertical axis," not
- * an exact footprint.
+ * Крок 11, Section C replaced Mint's material with a procedural granite grey
+ * plus a *geometric* foliage guess — "green where radius > 0.6..0.8 * maxRadius
+ * AND height > 0.5..0.65". That guess was wrong in the most visible way
+ * possible: the basin's raised rim is, by construction, both high and at large
+ * radius, so the mask fired across the entire rim and the whole formation
+ * rendered as one flat green bowl. The stone gradient underneath it was never
+ * visible at all.
+ *
+ * There was never a need to guess. Reading the .glb's own JSON chunk shows the
+ * material carries three baked textures Mint painted and the old code threw
+ * away:
+ *
+ *   baseColorTexture         (webp, via EXT_texture_webp) - grey granite,
+ *                            GREEN foliage on the pine canopies, BROWN bark on
+ *                            the trunks. Exactly the "листя зеленим, стовбур
+ *                            коричневим" the brief asks for, already authored.
+ *   normalTexture            (jpeg) - the surface detail
+ *   metallicRoughnessTexture (webp)
+ *
+ * So this now keeps the loaded material's maps and only overrides the
+ * *response* (roughness/metalness/side). The brief's fallback — "якщо не бачиш
+ * контурів, тоді просто закрась все в сірий" — is not needed, because the
+ * contours are in the texture rather than in the geometry.
+ *
+ * Two consequences worth knowing:
+ * - flatShading must be OFF. It was on to make the untextured grey read as
+ *   faceted stone; with a real normal map it fights the map and destroys the
+ *   baked detail.
+ * - `side` is forced to FrontSide. Mint marks the material doubleSided, which
+ *   for a closed rock means every covered pixel is shaded twice for no visual
+ *   difference — and this is the largest object on screen by area.
  */
-const ROCK_MIN_Y = -0.851;
-const ROCK_HEIGHT = 0.852 - ROCK_MIN_Y;
-const ROCK_MAX_RADIUS = 0.949;
+const ROCK_ROUGHNESS = 0.92;
 
-// Second accent after the ember (#C1440E, check/capture) — kept dark and
-// muted on purpose so it doesn't compete: not lighter in value than the
-// stone it grows out of. If the eye goes to the foliage before the board,
-// desaturate further rather than brightening the stone to compensate.
-const STONE_TOP = '#7C776C';
-const STONE_DEEP = '#4A4740';
-const FOLIAGE = '#55634E';
-
-const ROCK_MATERIAL = new THREE.MeshStandardMaterial({
-  color: '#6E6A62',
-  roughness: 0.95,
-  metalness: 0,
-  flatShading: true,
-});
+function applyRockMaterial(material) {
+  material.roughness = ROCK_ROUGHNESS;
+  material.metalness = 0;
+  material.flatShading = false;
+  material.side = THREE.FrontSide;
+  // Mint bakes lighting-neutral albedo, but the map comes in a touch pale
+  // against this scene's light key; a mild multiply keeps the granite from
+  // reading as white paper without desaturating the green and brown.
+  material.color = new THREE.Color('#B9B4A8');
+  material.needsUpdate = true;
+  return material;
+}
 
 /*
- * Vertical stone gradient (STONE_DEEP low -> STONE_TOP high) plus a
- * geometry-driven foliage mask, injected via onBeforeCompile rather than a
- * standalone ShaderMaterial — this keeps MeshStandardMaterial's real PBR
- * lighting (the environment map, the rim light carving out silhouettes,
- * shadow receiving) and only overrides where the diffuse colour itself
- * comes from. `vLocalPos` is the raw, pre-scale/offset `position` attribute
- * (object space), so the radius/height thresholds below are stable
- * regardless of RockModel's own scale/position transform on the outer group.
+ * THE FIT. Measured with tools/measure-rock.mjs (kept in the repo — re-run it
+ * if the export is regenerated), which rasterises the model's triangles into a
+ * 128x128 top-surface heightfield rather than binning vertices or trusting a
+ * Box3. Two things that method establishes and the previous derivation got
+ * wrong:
  *
- * The mask is smoothstepped, not a hard boolean (`radius > 0.7*maxRadius &&
- * localY > 0.6*height`) — a binary cutoff on flat-shaded, low-poly geometry
- * reads as a jagged, faceted edge between stone and foliage; the soft band
- * (0.6..0.8 radius, 0.5..0.65 height) blends across a couple of facets
- * instead.
+ * 1. The basin floor is at local Y = 0.417 and covers 68% of the top surface —
+ *    that part was right.
+ * 2. The old code fitted a *radius*: it put the floor's "flat radius" (0.65) at
+ *    BOARD_HALF_WIDTH * 1.1. But the board is a SQUARE, and a square of
+ *    half-width s reaches s*sqrt(2) at its corners. Fitting the half-width to a
+ *    radius leaves the four corners hanging over whatever lies between s and
+ *    1.414*s — which is where the rim is. That is the reported symptom: the
+ *    corners did not sit evenly in the basin.
+ *
+ * The table that actually answers it, counting cells whose top surface pokes
+ * more than 0.01 above the floor inside a square footprint of half-width s:
+ *
+ *     s      maxTopY   cells above floor
+ *   0.450     0.417            0
+ *   0.475     0.417            0     <- last fully clean footprint
+ *   0.500     0.460            2
+ *   0.591     0.469         ~380     <- what the old ROCK_SCALE produced
+ *   0.675     0.718         1125
+ *
+ * At the old effective s of 0.591 roughly 380 cells of rock stood above the
+ * basin floor inside the board's own footprint, up to 0.052 local units — which
+ * at the old scale is 0.38 world units, more than the board slab's 0.30
+ * thickness, so rock genuinely pushed up past the playing surface at the edges.
+ *
+ * ROCK_FIT_HALF_WIDTH is therefore 0.46, just inside the last clean value, and
+ * it is fitted to the board's HALF-WIDTH in both X and Z (the footprint check
+ * above is a square, so the corners are already accounted for).
  */
-ROCK_MATERIAL.onBeforeCompile = (shader) => {
-  shader.uniforms.uMinY = { value: ROCK_MIN_Y };
-  shader.uniforms.uHeight = { value: ROCK_HEIGHT };
-  shader.uniforms.uMaxRadius = { value: ROCK_MAX_RADIUS };
-  shader.uniforms.uStoneTop = { value: new THREE.Color(STONE_TOP) };
-  shader.uniforms.uStoneDeep = { value: new THREE.Color(STONE_DEEP) };
-  shader.uniforms.uFoliage = { value: new THREE.Color(FOLIAGE) };
-
-  shader.vertexShader = shader.vertexShader
-    .replace('#include <common>', '#include <common>\nvarying vec3 vLocalPos;')
-    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLocalPos = position;');
-
-  shader.fragmentShader = shader.fragmentShader
-    .replace(
-      '#include <common>',
-      `#include <common>
-      varying vec3 vLocalPos;
-      uniform float uMinY;
-      uniform float uHeight;
-      uniform float uMaxRadius;
-      uniform vec3 uStoneTop;
-      uniform vec3 uStoneDeep;
-      uniform vec3 uFoliage;`,
-    )
-    .replace(
-      '#include <color_fragment>',
-      `#include <color_fragment>
-      {
-        float heightFrac = clamp((vLocalPos.y - uMinY) / uHeight, 0.0, 1.0);
-        float radius = length(vLocalPos.xz);
-        float edgeRadius = smoothstep(0.6 * uMaxRadius, 0.8 * uMaxRadius, radius);
-        float topHeight = smoothstep(0.5, 0.65, heightFrac);
-        float foliageMask = edgeRadius * topHeight;
-        vec3 stoneColor = mix(uStoneDeep, uStoneTop, heightFrac);
-        diffuseColor.rgb = mix(stoneColor, uFoliage, foliageMask);
-      }`,
-    );
-};
+const ROCK_FIT_HALF_WIDTH = 0.46;
+const ROCK_FLOOR_Y_RAW = 0.417;
+const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
 
 /*
- * Measured, not guessed — a one-time raycast grid (40 radii x 6 angles,
- * downward rays against the raw, unscaled model) rather than a plain Box3:
- * this model's usable top is NOT its bounding-box max, because a raised rim
- * sits above the flat inner area (exactly the thing the brief warned not to
- * let the board overlap). The scan found the flat plateau at local Y=0.417,
- * constant out to r=0.65 (every sample exactly 0.417); by r=0.70 some
- * samples had already climbed to 0.46-0.47 — the rim starting. 0.65 is the
- * last radius confirmed still flat in every direction sampled, so it's used
- * as-is rather than pushed closer to the actual break to leave margin.
+ * Y is scaled SEPARATELY, and deliberately not by ROCK_SCALE_XZ.
  *
- * ROCK_SCALE puts that flat radius at BOARD_HALF_WIDTH * 1.1 (4.73) — the
- * exact same margin PEDESTAL_RADIUS already uses, so "a little wider than
- * the board" means the identical thing whether the rock is the real model or
- * the temporary disc. ROCK_Y_OFFSET then drops the scaled model so its flat
- * top lands exactly at Y, the same resting height the pedestal uses.
+ * Widening the footprint 28% to seat the board would have raised the rim and
+ * the pines by the same 28%, taking the rim's top from y=+2.85 to y=+3.75 world.
+ * The camera at MAX_POLAR_ANGLE (1.25 rad) and CameraRig's resting distance
+ * sits at y = 11.55*cos(72 deg) = 3.57 — i.e. the shallowest legal camera would
+ * have ended up *below* the rim, looking into the outside of the bowl instead of
+ * across the board. Holding Y at the previous scale keeps every height in the
+ * scene exactly where the existing camera clamps were verified against, so this
+ * change cannot reopen that question: the rock simply becomes a wider, shallower
+ * bowl. On an irregular rock formation the anisotropy is not readable as one.
  */
-const ROCK_FLAT_RADIUS_RAW = 0.65;
-const ROCK_FLAT_Y_RAW = 0.417;
-const ROCK_SCALE = (BOARD_HALF_WIDTH * 1.1) / ROCK_FLAT_RADIUS_RAW;
-const ROCK_Y_OFFSET = Y - ROCK_FLAT_Y_RAW * ROCK_SCALE;
+const ROCK_SCALE_Y = 7.277;
+const ROCK_Y_OFFSET = Y - ROCK_FLOOR_Y_RAW * ROCK_SCALE_Y;
 
 /**
  * Stand-in while ROCK_MODEL doesn't exist: a flat, sharp-edged disc (no rim
@@ -160,12 +151,16 @@ function TemporaryPedestal() {
 }
 
 /**
- * Loads and normalizes the real GLB rock formation. Mirrors PieceModel.jsx's
- * own pipeline: Mint's own materials/textures are discarded for one
- * procedural granite material, matching how every piece on the board is
- * treated. Scale/position come from ROCK_SCALE/ROCK_Y_OFFSET above (measured
- * once via raycasting, not recomputed live — this is a single static asset,
- * not something that gets regenerated per-session the way pieces might be).
+ * Loads and fits the real GLB rock formation.
+ *
+ * Unlike PieceModel.jsx — which replaces Mint's materials outright, because the
+ * bone/lacquer palette is load-bearing for reading the board — this KEEPS the
+ * loaded material and its three baked maps, and only adjusts the surface
+ * response. See applyRockMaterial above for why.
+ *
+ * Scale/position come from the constants above, measured once with
+ * tools/measure-rock.mjs. This is a single static asset, so nothing here is
+ * recomputed at runtime.
  */
 function RockModel() {
   const { scene } = useGLTF(ROCK_MODEL);
@@ -173,16 +168,23 @@ function RockModel() {
   const instance = useMemo(() => {
     const clone = scene.clone(true);
     clone.traverse((node) => {
-      if (node.isMesh) {
-        node.material = ROCK_MATERIAL;
-        // It's the lowest thing in the scene — nothing below it to shadow.
-        node.castShadow = false;
-        // Catches the board's own shadow, same job TemporaryPedestal's
-        // receiveShadow does.
-        node.receiveShadow = true;
-      }
+      if (!node.isMesh) return;
+      /*
+       * scene.clone(true) shares materials with the cached useGLTF scene, so
+       * mutating in place would edit drei's cache entry — harmless today (one
+       * instance) but it would silently leak into any future second use of the
+       * same model. Clone the material, then adjust the clone.
+       */
+      node.material = applyRockMaterial(node.material.clone());
+      // It's the lowest thing in the scene — nothing below it to shadow.
+      node.castShadow = false;
+      // Catches the board's own shadow, same job TemporaryPedestal's
+      // receiveShadow does.
+      node.receiveShadow = true;
     });
-    clone.scale.setScalar(ROCK_SCALE);
+    // Non-uniform on purpose — see ROCK_SCALE_Y's comment. three derives the
+    // normal matrix as the inverse-transpose of this, so lighting stays correct.
+    clone.scale.set(ROCK_SCALE_XZ, ROCK_SCALE_Y, ROCK_SCALE_XZ);
     clone.position.y = ROCK_Y_OFFSET;
     return clone;
   }, [scene]);

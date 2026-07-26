@@ -6,8 +6,9 @@ import CameraRig from './CameraRig';
 import IntroCameraRig, { INTRO_START_POSITION } from './IntroCameraRig';
 import { useChessGame } from '../lib/useChessGame';
 import { computeVisibility } from '../lib/visibility';
+import { ALL_SQUARES, squaresBetween } from '../lib/fog';
 import Board from './Board';
-import Pieces from './Pieces';
+import Pieces, { MOVE_DURATION } from './Pieces';
 import Fog from './Fog';
 import Lighting from './Lighting';
 import Backdrop, { BACKDROP_FOG } from './Backdrop';
@@ -15,6 +16,7 @@ import RockIsland, { SHOW_ROCK_ISLAND } from './RockIsland';
 import { playMoveSound } from './audio';
 import HUD from './HUD';
 import IntroOverlay from './IntroOverlay';
+import PromotionModal from './PromotionModal';
 
 // Only ever seen for the one frame before the canvas paints (or if WebGL is
 // unavailable) — SkyDome now covers the camera at every angle once mounted.
@@ -93,26 +95,32 @@ const MAX_POLAR_ANGLE = 1.25;
  */
 
 /*
- * Крок 8, Section B: the intro's three shots reuse the real fog-of-war
- * machinery (Fog + Pieces both key off a `visibility` Set) instead of a
- * separate mock scene — see IntroCameraRig.jsx's per-frame comments for what
- * each shot is going for. Frame 0 stays almost entirely fogged (empty set —
- * pieces read as silhouettes, per the brief). Frame 1 reveals exactly one
- * square: the black knight's home square, which is deliberately the only
- * enemy piece that renders, sitting right at the fog mask's frontier — the
- * shader's own edge-thickening does the "half in mist, half lit" work for
- * free. Frame 2 uses the real starting-position visibility computed below,
- * because a bird's-eye view of near-clear/far-fogged IS the mechanic, not a
- * mockup of it.
+ * Крок 12, Section B: NO FOG ON THE INTRO.
+ *
+ * Крок 8, Section B built the intro's three shots on top of the real fog-of-war
+ * machinery (Fog + Pieces both key off a `visibility` Set) — frame 0 with an
+ * empty set so everything read as fogged, frame 1 with only g8 clear so the
+ * black knight sat alone at the frontier, frame 2 with the live starting
+ * visibility. Reusing the real mechanic instead of mocking one is still the
+ * right architecture and is not what changed here.
+ *
+ * What changed is the brief: the loading/intro screen should not be under fog
+ * at all. It is the first thing anyone sees, and three shots of a near-uniform
+ * grey sheet is a bad first frame — it hides the board, the pieces, and the
+ * rock the whole composition is built on.
+ *
+ * So during 'intro' and 'transitioning' the fog mesh is not mounted at all (see
+ * the Canvas children below) and visibility is FULL. Both halves of that matter:
+ * dropping the fog alone would leave `Pieces`' own rule ("an enemy piece outside
+ * `visibility` is not rendered") in force, so Black's whole side would simply be
+ * missing from the intro — an empty half-board with nothing covering it, which
+ * reads worse than the fog did. ALL_VISIBLE makes the intro show the complete
+ * set on a clear board.
+ *
+ * The real fog is still the first thing the player sees *of the mechanic*: it
+ * appears as gameplay starts, which is also when the HUD and controls arrive.
  */
-const INTRO_EMPTY_VISIBILITY = new Set();
-const INTRO_KNIGHT_VISIBILITY = new Set(['g8']);
-
-function introVisibilityFor(frameIndex, gameVisibility) {
-  if (frameIndex === 1) return INTRO_KNIGHT_VISIBILITY;
-  if (frameIndex === 2) return gameVisibility;
-  return INTRO_EMPTY_VISIBILITY;
-}
+const ALL_VISIBLE = new Set(ALL_SQUARES);
 
 const INTRO_SEEN_KEY = 'dead-reckoning:intro-seen';
 
@@ -194,11 +202,44 @@ export default function GameCanvas() {
   const [selectedSquare, setSelectedSquare] = useState(null);
   const [hoveredSquare, setHoveredSquare] = useState(null);
 
+  /*
+   * Крок 13: promotion is now an HTML modal (4 squares, 2x2) instead of a
+   * floating 3D picker, so it has to live outside the <Canvas> tree the same
+   * way HUD does. Board still owns pendingPromotion state and the actual
+   * makeMove/clearSelection closures (it already has canInteract, targets,
+   * etc.) — it just hands the whole {square, onPick, onCancel} bundle
+   * upward, mirroring onSelectedChange/onHoveredChange above, instead of
+   * GameCanvas trying to re-derive Board's internal completion logic.
+   */
+  const [pendingPromotion, setPendingPromotion] = useState(null);
+
+  /*
+   * Крок 13: squares an own piece's in-flight move animation is currently
+   * passing over, temporarily unioned into the Set fed to <Fog> only (never
+   * to <Pieces>) — see squaresBetween in lib/fog.js for the full bug this
+   * fixes ("fog jumps in front of and covers a piece" during a slide across
+   * several ranks/files). Only meaningful for the player's own moves: an
+   * enemy piece's reveal animation flying in from off-screen is fine to
+   * flicker under fog mid-flight, since the player never had eyes on that
+   * path either.
+   */
+  const [flightClearSquares, setFlightClearSquares] = useState(() => new Set());
+
+  useEffect(() => {
+    const move = history.length ? history[history.length - 1] : null;
+    if (!move || move.color !== PLAYER_COLOR) {
+      setFlightClearSquares(new Set());
+      return;
+    }
+    setFlightClearSquares(new Set(squaresBetween(move.from, move.to)));
+    const timer = setTimeout(() => setFlightClearSquares(new Set()), MOVE_DURATION * 1000);
+    return () => clearTimeout(timer);
+  }, [history]);
+
   // 'intro' -> 'transitioning' -> 'playing'. IntroCameraRig owns the camera
   // for the first two; real OrbitControls + CameraRig only mount for the
   // third — see the Canvas children below.
   const [phase, setPhase] = useState(initialPhase);
-  const [introFrameIndex, setIntroFrameIndex] = useState(0);
   // Mutated imperatively from inside the Canvas (IntroCameraRig's useFrame),
   // never through React state — see FogLayer/CameraRig for the same pattern
   // elsewhere in this codebase.
@@ -214,8 +255,15 @@ export default function GameCanvas() {
   }
 
   const gameVisibility = computeVisibility(game, PLAYER_COLOR);
-  const visibility =
-    phase === 'intro' ? introVisibilityFor(introFrameIndex, gameVisibility) : gameVisibility;
+  // Крок 12, Section B: the intro and the hand-off both run clear — see
+  // ALL_VISIBLE's comment. Only 'playing' gets the real fog-of-war set.
+  const showFog = phase === 'playing';
+  const visibility = showFog ? gameVisibility : ALL_VISIBLE;
+  // Крок 13: fog-only, never fed to <Pieces> — see squaresBetween in
+  // lib/fog.js and flightClearSquares' own comment above for why an own
+  // piece's flight path needs a temporary exemption from the fog volume.
+  const fogVisibility =
+    showFog && flightClearSquares.size ? new Set([...visibility, ...flightClearSquares]) : visibility;
   const canInteract =
     phase === 'playing' && turn === PLAYER_COLOR && status !== 'checkmate' && status !== 'draw';
 
@@ -278,6 +326,7 @@ export default function GameCanvas() {
           makeMove={makeMove}
           onSelectedChange={setSelectedSquare}
           onHoveredChange={setHoveredSquare}
+          onPendingPromotionChange={setPendingPromotion}
         />
         <Pieces
           board={board}
@@ -294,10 +343,11 @@ export default function GameCanvas() {
             piece itself.
 
             `far` is a height above the plane, and only 0.85 of it: a contact
-            shadow wants the bottom of a piece, not its whole silhouette, and
-            0.85 also lands below the promotion picker's plates at 0.95 so the
-            panel casts no blobs onto the board underneath it. Raising this to
-            clear the king's full 1.45 would do both of the wrong things.
+            shadow wants the bottom of a piece, not its whole silhouette.
+            Raising this to clear the king's full 1.45 would blur that into a
+            shadow of the whole piece instead. (Promotion is an HTML modal
+            now, not a floating 3D panel, so this no longer has to dodge one
+            — see components/PromotionModal.jsx.)
 
             Left on drei's default continuous refresh: the pieces move, and one
             512px depth pass is cheap next to the fog shader already running
@@ -312,7 +362,15 @@ export default function GameCanvas() {
           color="#2A241C"
         />
 
-        <Fog visibility={visibility} lastMove={lastMove} enemyPieceSquares={enemyPieceSquares} />
+        {/* Not mounted at all during the intro, rather than mounted with a
+            full-visibility mask: an unmounted fog mesh is one fewer transparent
+            full-board draw during the intro, and it also means the very first
+            fog the player ever sees is a freshly-mounted mask settling into the
+            real starting position rather than a 64-square dissolve firing on the
+            hand-off frame. See ALL_VISIBLE above. */}
+        {showFog && (
+          <Fog visibility={fogVisibility} lastMove={lastMove} enemyPieceSquares={enemyPieceSquares} />
+        )}
 
         {phase === 'playing' ? (
           <>
@@ -345,7 +403,6 @@ export default function GameCanvas() {
           <IntroCameraRig
             phase={phase}
             overlayRef={crossfadeRef}
-            onFrameIndexChange={setIntroFrameIndex}
             onTransitionComplete={() => setPhase('playing')}
           />
         )}
@@ -389,6 +446,13 @@ export default function GameCanvas() {
       />
 
       {phase === 'intro' && <IntroOverlay onStart={handleStart} />}
+
+      {/* HTML modal, not a floating 3D panel (Крок 13) — see
+          components/PromotionModal.jsx. onPick/onCancel are Board's own
+          closures over pendingPromotion, handed up unchanged. */}
+      {pendingPromotion && (
+        <PromotionModal onPick={pendingPromotion.onPick} onCancel={pendingPromotion.onCancel} />
+      )}
     </div>
   );
 }

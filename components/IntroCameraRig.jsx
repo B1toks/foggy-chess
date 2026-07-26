@@ -121,7 +121,11 @@ function frameAt(t) {
 /**
  * @param phase 'intro' | 'transitioning' (not mounted at all once 'playing')
  * @param overlayRef DOM ref to the crossfade wash div, mutated imperatively
- * @param onFrameIndexChange(index) called only when the active shot changes
+ * @param onFrameIndexChange(index) optional, called only when the active shot
+ *   changes. Nothing consumes it as of Крок 12, Section B — GameCanvas used to
+ *   swap the fog's `visibility` Set per shot, and the intro no longer has fog at
+ *   all. Kept as a hook because "which shot is on screen" is the natural thing
+ *   for a future per-shot effect to key off, and it costs one optional call.
  * @param onTransitionComplete called once the hand-off to gameplay finishes
  */
 export default function IntroCameraRig({
@@ -172,7 +176,7 @@ export default function IntroCameraRig({
 
       if (index !== lastFrameIndex.current) {
         lastFrameIndex.current = index;
-        onFrameIndexChange(index);
+        onFrameIndexChange?.(index);
       }
 
       const frame = FRAMES[index];

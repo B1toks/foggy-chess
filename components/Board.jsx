@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { squareToWorld } from '../lib/coords';
 import { ALL_SQUARES, HIGHLIGHT_HEIGHT } from '../lib/fog';
-import PromotionPicker from './PromotionPicker';
 import { getBoardRoughnessMap } from './proceduralTextures';
 import { sfx } from './audio';
 
@@ -35,6 +34,7 @@ export default function Board({
   makeMove,
   onSelectedChange,
   onHoveredChange,
+  onPendingPromotionChange,
 }) {
   const [selected, setSelected] = useState(null);
   const [targets, setTargets] = useState([]);
@@ -54,6 +54,26 @@ export default function Board({
   useEffect(() => {
     onHoveredChange?.(hovered);
   }, [hovered, onHoveredChange]);
+
+  // Крок 13: promotion is an HTML modal now (components/PromotionModal.jsx),
+  // which has to live outside the <Canvas> tree — so Board hands the whole
+  // completion bundle upward instead of rendering a 3D picker itself. Board
+  // still owns pendingPromotion and the actual makeMove/clearSelection
+  // closures; GameCanvas just renders whatever this reports.
+  useEffect(() => {
+    onPendingPromotionChange?.(
+      pendingPromotion
+        ? {
+            square: pendingPromotion.to,
+            onPick: (promotion) => {
+              makeMove(pendingPromotion.from, pendingPromotion.to, promotion);
+              clearSelection();
+            },
+            onCancel: clearSelection,
+          }
+        : null,
+    );
+  }, [pendingPromotion, onPendingPromotionChange]);
 
   /*
    * One roughness map per square, each a clone of a single 512px noise texture
@@ -250,17 +270,6 @@ export default function Board({
         </bufferGeometry>
         <lineBasicMaterial color={GRID} transparent opacity={0.42} depthWrite={false} />
       </lineSegments>
-
-      {pendingPromotion && (
-        <PromotionPicker
-          square={pendingPromotion.to}
-          onPick={(promotion) => {
-            makeMove(pendingPromotion.from, pendingPromotion.to, promotion);
-            clearSelection();
-          }}
-          onCancel={clearSelection}
-        />
-      )}
     </group>
   );
 }

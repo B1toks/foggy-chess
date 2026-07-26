@@ -146,7 +146,15 @@ function FpsCounter() {
   return <>{fps} fps</>;
 }
 
-/** The large check/checkmate flash — same ember as the board's own move highlight. */
+/*
+ * The large checkmate flash — same ember as the board's own move highlight.
+ * There is deliberately no equivalent "Check" flash: the fog hides enemy
+ * pieces the player hasn't seen move, and a check warning would announce
+ * "something you can't see is attacking your king" regardless of whether the
+ * attacker is actually visible. That's exactly the surprise fog of war is
+ * supposed to allow — a player who never spots the attacker should be able
+ * to walk straight into a checkmate with no on-screen tell beforehand.
+ */
 function StatusFlash({ text }) {
   return (
     <div
@@ -180,6 +188,10 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
   const turnLabel = turn === 'w' ? 'White (you)' : 'Black (AI)';
   const isOver = status === 'checkmate' || status === 'draw';
 
+  // Check is deliberately not surfaced anywhere in the HUD — see the
+  // StatusFlash comment below for why: telling the player their king is
+  // under attack is exactly the kind of information the fog is supposed to
+  // withhold when the attacker itself is unseen.
   let message;
   if (status === 'checkmate') {
     // chess.js leaves `turn` on the side that has been mated.
@@ -187,8 +199,6 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
     message = `Checkmate — ${winner} wins`;
   } else if (status === 'draw') {
     message = 'Draw';
-  } else if (status === 'check') {
-    message = `Check — ${turnLabel} to move`;
   } else {
     message = `${turnLabel} to move`;
   }
@@ -256,7 +266,6 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
             )}
           </div>
 
-          {status === 'check' && <StatusFlash text="Check" />}
           {status === 'checkmate' && <StatusFlash text="Checkmate" />}
         </>
       )}

@@ -111,7 +111,7 @@ them back.
 | Grid lines | `#2B2018` @ 0.42 |
 | Move/selection highlight | `#C1440E` (low opacity) |
 | Fog | `#EDEBE3` (transparent, `depthWrite: false`) |
-| White piece ("bone") | `#DDD3BE`, roughness `0.78`, metalness `0` |
+| White piece ("bone") | `#DDD3BE`, roughness `0.58`, metalness `0`, clearcoat `0.8` (Крок 13 — see "3D models") |
 | Black piece ("lacquer") | `#0E0E10`, roughness `0.32`, metalness `0.15` |
 | Sky | CSS gradient `#F4F0E7 -> #E7DFD0 -> #CDC1AA` |
 
@@ -180,29 +180,40 @@ changing this (`?exp=` makes it a one-URL experiment).
 
 ## Promotion
 
-`components/PromotionPicker.jsx`. The player's promoting move is **not played
-when the square is clicked** — `Board` holds it in `pendingPromotion` and the
-pawn stays put, so Esc or a click past costs nothing. The AI still auto-queens
-(`makeMove`'s `promotion` defaults to `'q'`), which is what a greedy AI would
-pick anyway.
+`components/PromotionModal.jsx` — a plain HTML modal (2x2 grid of buttons,
+one per promotion piece), rendered in `GameCanvas.jsx` outside the `<Canvas>`
+tree, the same layer HUD lives in. The player's promoting move is **not
+played when the square is clicked** — `Board` holds it in `pendingPromotion`
+and the pawn stays put, so Esc or a click past (or a click on the modal's own
+scrim) costs nothing. The AI still auto-queens (`makeMove`'s `promotion`
+defaults to `'q'`), which is what a greedy AI would pick anyway.
+
+**Крок 13: replaced the old 3D `PromotionPicker`** (a floating row of real
+piece models above the promoting square, yawing to face the camera every
+frame). That component needed a real derivation just to stay on screen — see
+git history on the deleted file for the `SCALE`/`LIFT`/`PULL` reasoning it
+took to keep it from being cropped by the frame on the far rank — and still
+had to fight the camera on every move. A flat HTML modal has none of that: it
+is always centred and always the same size regardless of where on the board
+the pawn promotes or how the camera happens to be oriented. `Board.jsx` still
+owns `pendingPromotion` state and the actual `makeMove`/`clearSelection`
+closures — it just hands the whole `{square, onPick, onCancel}` bundle
+upward via `onPendingPromotionChange`, mirroring how `onSelectedChange`/
+`onHoveredChange` already lift selection state to `GameCanvas`, rather than
+`GameCanvas` trying to re-derive Board's own completion logic.
+
+The modal's four options use the "black chess piece" Unicode glyphs
+(♛♜♝♞), not "white" (♕♖♗♘), despite every option being one of the
+player's own (white) pieces — purely a rendering choice: in essentially every
+font implementing this block, the "white" code points render as hollow
+outlines and the "black" ones render as solid silhouettes, independent of CSS
+`color`. A solid dark glyph is what actually reads clearly against the modal's
+light bone-coloured buttons.
 
 `useChessGame.isPromotion(from, to)` reads chess.js' `flags` for `'p'`. Deriving
 it from the destination rank instead would also fire for a rook or queen simply
 arriving on the back rank. `lib/rules.test.js` pins both that flag and the
 `promotion:` code -> piece mapping.
-
-The panel's geometry is set by the frame, not by taste. Promotion happens on the
-8th rank — the far edge, at -28 degrees, with the frame top only 12 degrees
-above it. Full-size models 1.7 units straight up were **cut off by the top of
-the viewport**. Three things fix it together: `SCALE = 0.72` so it reads as a
-panel rather than four more pieces, a smaller `LIFT`, and `PULL` toward the
-camera — a point at fixed height moves *down* the frame as it nears, so the
-pull buys vertical room as well as putting the choice closer to hand.
-
-The row yaws to face the camera every frame, and the yaw is **also seeded at
-render time** from `useThree`'s camera: `useFrame` does not run until after the
-first frame is committed, so without the seed the panel appears once unrotated,
-foreshortened into a clump.
 
 ## Piece interaction (Крок 8, Section C)
 
@@ -249,8 +260,9 @@ out of `instances` — it moves into a separate `ghosts` list and renders as a
 short-lived `<CaptureGhost>` that fades its own opacity to 0 over
 `CAPTURE_FADE_DURATION` (0.4s) before calling back to remove itself. This
 needed one change to `PieceModel.jsx`: every *live* piece shares one of two
-module-level `MeshStandardMaterial` singletons (`BONE`/`LACQUER`) — cheap, but
-it means animating opacity on one piece would fade every piece of that colour.
+module-level material singletons (`BONE`/`LACQUER`, see "3D models") — cheap,
+but it means animating opacity on one piece would fade every piece of that
+colour.
 `PieceModel`'s new `fade` prop clones the shared material once for that
 instance instead of reusing it, so `CaptureGhost` can drive its own opacity
 independently. Ghosts are short-lived (one fade, then unmounted), so the extra
@@ -294,12 +306,22 @@ player's, and `lib/` stays browser-free. Only `select` is fired from `Board`.
 - **No card.** The status text used to sit in a bordered, backgrounded panel;
   it's now plain text directly on the scene, legibility carried by a
   text-shadow instead of a background chip.
-- **Check/checkmate get a dedicated flash** — `StatusFlash` — the board's own
-  ember (`#C1440E`), large, centred at the top of the frame, with a brief
-  `hud-status-flash` keyframe fade-in. Text is Ukrainian ("Шах"/"Мат")
-  specifically because that's what the brief asked for there, even though the
-  smaller ongoing status line next to it is still English — a pre-existing
-  inconsistency this pass didn't take on fixing everywhere.
+- **Checkmate gets a dedicated flash** — `StatusFlash` — the board's own ember
+  (`#C1440E`), large, centred at the top of the frame, with a brief
+  `hud-status-flash` keyframe fade-in.
+- **Крок 13: there is deliberately no "Check" flash, and no "Check — X to
+  move" status text either** — both existed before this pass and were
+  removed. The fog hides enemy pieces the player hasn't seen move; a check
+  warning announces "something you can't see is attacking your king"
+  regardless of whether the attacker itself is actually visible, which leaks
+  exactly the information fog of war exists to withhold. A player who never
+  spots the attacker can now walk straight into a checkmate — status
+  `'check'` still exists in `useChessGame`'s state machine (chess.js's own
+  legal-move filtering already prevents a player from making a move that
+  leaves their own king in check, so the state is still needed for that), it
+  is just never surfaced in the HUD. `status === 'checkmate'` still gets the
+  flash and the status line's win message, since the game has genuinely ended
+  at that point and there is nothing left to withhold.
 - **Sound and "New game" share one corner and one visual style** (the
   `CORNER_BUTTON_STYLE` object both buttons spread) — small, semi-transparent
   square icon buttons, bottom-right. "New game" only renders once
@@ -320,6 +342,63 @@ too — it's a global preference, not part of the game state, and the intro's
 own wind-bed ambience is worth being able to turn on before the board is even
 interactive.
 
+## Asset budget (Крок 12, Section A) — read this before profiling anything else
+
+**Every model Mint delivered was exactly 500,000 triangles.** That is a cap on
+Mint's side, not a number anyone chose. Measured straight off the `.glb` JSON
+chunks (accessor `count`s stay correct under Draco):
+
+```
+bishop 499,998   king 499,998   knight 500,000   pawn 499,998
+queen  500,000   rook 500,000   granite-pine-aerie 500,000
+```
+
+32 pieces on the board = 16,000,000 triangles, plus 500k for the rock, and that
+geometry is submitted **three times per frame**: the key light's shadow map, drei
+`<ContactShadows>`' depth pass (which re-renders continuously), and the colour
+pass. **~49.5 million triangles per frame**, ~3.0 billion/second at 60fps, for a
+chess set where no piece is more than a couple of hundred pixels tall. That —
+not the fog shader — is why a 4060 sat pinned at 90%. The scene was
+geometry-bound, and no amount of shader tuning touches it.
+
+`tools/decimate-models.mjs` fixes it. Measured in-browser via `window.__scene`
+traversal, opening position: **8,502,106 → 160,102 triangles per pass** (the
+start position renders 16 white pieces + rock; Black's are inside fog and not
+drawn). Download: **32 MB → 1.9 MB**.
+
+Two things about that tool are load-bearing:
+
+- **The `Permissive` simplifier flag.** These exports are not clean manifolds.
+  `tools/diagnose-mesh.mjs` measures it: the knight welds to 418,533 verts for
+  500,000 triangles (a closed manifold would be ~250,000), shatters into
+  **38,146 disconnected components of which 37,251 have under 10 vertices**, and
+  carries 269,120 boundary edges. Ordinary edge-collapse has almost nothing it
+  is allowed to collapse, so it stalls at ~21% and `error` makes no difference
+  whatsoever past 0.001 (knight at ratio 0.006: error 0.001 → 111,268 tris;
+  error 0.3 → 107,784, a hard topological floor). `@gltf-transform/functions`'
+  `simplify()` only surfaces `lockBorder` and never passes meshopt's other flags
+  through, so the tool wraps the simplifier to inject them. With `Permissive` the
+  target is reached exactly. **If a regenerated export won't decimate, this is
+  why.**
+- **Pieces drop TANGENT, TEXCOORD_0 and all three baked textures.**
+  `PieceModel.jsx` replaces every piece material with the shared BONE/LACQUER
+  `MeshStandardMaterial`, which has no normal map — so those were downloaded,
+  decoded, and uploaded to the GPU purely to be discarded. The **rock is
+  deliberately excluded**: Section D below now *uses* its baked maps.
+
+Originals are preserved in `assets-src/models-original/` — gitignored and
+outside `public/`, like `mountains-source.png`. The tool refuses to run twice
+(a second pass would decimate the already-decimated file) and never overwrites
+a backup. `node tools/decimate-models.mjs` alone is a dry run; `--write` applies.
+
+Also `next.config.mjs` now pins `outputFileTracingRoot` to the project. Without
+it Next found an unrelated lockfile in a parent directory, handed that to
+Watchpack, and Watchpack recursively scanned the whole `D:` drive — producing
+`lstat 'D:\System Volume Information'` errors and then killing the dev server
+outright with `RangeError: Array buffer allocation failed`. It presents exactly
+like the flaky-HMR failure in "Dev-server gotcha" below and is **not** fixed by
+clearing `.next`, because the cause is outside the project.
+
 ## 3D models
 
 Six Draco-compressed `.glb` files in `public/models/`, named exactly
@@ -328,6 +407,9 @@ type — both colors reuse the same geometry**, cloned per instance and
 re-materialed. If a piece looks "wrong" on one square but right on another,
 it is the viewing azimuth, not a second model; verify with `md5sum` before
 chasing a phantom duplicate.
+
+They are ~8,000 triangles each as of Крок 12 — see "Asset budget" above before
+concluding a silhouette looks wrong for some other reason.
 
 Mint exports every model normalized into roughly the same ~1.9-unit
 bounding cube (measured raw heights span only 1.8848–1.9041). So a raw
@@ -341,12 +423,32 @@ leftover base plate or stray vertex — not the visible silhouette.
 - `normalizeHeight()` scales to `PIECE_CONFIG[type].targetHeight`, then
   re-measures and subtracts `box.min.y` so the base sits exactly on y=0.
 - `applyMaterial()` **replaces** whatever material came out of Mint with the
-  shared `BONE` / `LACQUER` `MeshStandardMaterial` and sets castShadow +
-  receiveShadow. Mint's own textures/materials are always discarded.
+  shared `BONE` / `LACQUER` material and sets castShadow + receiveShadow.
+  Mint's own textures/materials are always discarded.
 
 Board position goes on a wrapping `<group>`, never on the `<primitive>`
 itself — the primitive carries the normalization transform and must not have
 it overwritten.
+
+**Крок 13: BONE is `MeshPhysicalMaterial` now, not `MeshStandardMaterial`,**
+specifically for a thin `clearcoat` layer (`0.8`, `clearcoatRoughness 0.08`).
+White pieces were reported as looking "raw" next to the black ones — the
+LACQUER material already looks finished because a specular highlight is
+visually loud against its near-black diffuse base; the same highlight on
+BONE's light base just blends into the colour already there. Lowering
+`roughness` alone (tried down to 0.34) barely helped for that reason. A
+clearcoat is a second, independent Fresnel reflection on top of the diffuse/
+roughness response, so it reads as a polished-ivory skin regardless of how
+light the material under it is. `roughness` stays fairly high (0.58) so the
+body of the material is still matte bone/stone, not plastic; `metalness`
+stays `0` — bone is a dielectric, clearcoat is what's doing the work.
+**`flatShading` stays `true`** — also tried `false` (letting the model's own
+imported normals drive smooth shading) on the theory that BONE's visible
+facet edges read as more "unfinished" than LACQUER's; screenshot proved the
+opposite, since the decimated mesh is exactly as non-manifold as "Asset
+budget" documents (the knight alone has 38,146 disconnected components) and
+smooth shading across it produced mottled dark blotches on every piece,
+worse than flat. flatShading is not the source of the raw-vs-finished gap.
 
 `PIECE_SCALE` in `lib/pieces.js` is the **only** knob for fitting pieces to a
 1-unit square. `normalizeHeight` multiplies `targetHeight` by it, so the
@@ -402,7 +504,7 @@ components/GameCanvas.jsx  — Canvas, camera, lights, OrbitControls; owns useCh
 components/IntroCameraRig.jsx — scripted camera for the intro's three shots + the hand-off transition into gameplay (see "Intro")
 components/IntroOverlay.jsx — the intro's stable text (title, tagline, start button); transparent, no background art of its own, each text block sits on its own blurred scrim (see "Intro" -> "Крок 9.6")
 components/Board.jsx       — 64 tile meshes, click-to-select/move, legal-move highlight, pending-promotion state; reports selected/hovered squares upward
-components/PromotionPicker.jsx — 3D piece choices above the promoting square; camera-facing, self-cancelling
+components/PromotionModal.jsx — HTML modal (2x2 grid) for the promotion choice, rendered outside <Canvas> (see "Promotion")
 components/RockIsland.jsx  — what the board sits on: a small floating rock (real GLB model, temporary pedestal is the rollback) — see "RockIsland"
 components/SkyDome.jsx     — full sphere behind everything, gradient + faint fbm haze (see "Camera and environment")
 components/proceduralTextures.js — canvas noise -> roughness/alpha maps for the backdrop edge fade and board tiles
@@ -410,7 +512,9 @@ components/audio.js        — synthesised SFX + wind bed, off by default
 components/Pieces.jsx      — reconciles chess.js's board into identity-stable piece instances; owns move/hover/capture animation (see "Piece interaction")
 components/PieceModel.jsx  — GLTF load + height normalization + material override (see "3D models")
 components/DevPieceRow.jsx — dev-only side-on comparison row + measurement probe
-components/FogLayer.jsx    — 64 persistent fog planes, opacity lerped imperatively in useFrame (never via React state)
+components/FogShader.jsx   — tier 2 fog: one raymarched box over the board (see "Fog" -> Крок 12 Section C)
+components/FogLayer.jsx    — tier 1 rollback: 64 persistent fog planes, opacity lerped imperatively in useFrame (never via React state)
+tools/                     — checked-in measurement/asset scripts; see "QA hooks"
 components/HUD.jsx         — plain DOM overlay (turn/status, sound + new-game corner, control hint), absolutely positioned over the canvas
 lib/coords.js              — squareToWorld/worldToSquare, board centered at origin, a1 at the corner, 1 unit/cell
 lib/easing.js              — easeInOutCubic (intro camera + board move), easeOutCubic (fog wave + piece reveal, Крок 10 Section C)
@@ -426,10 +530,148 @@ lib/ai.js                  — pickGreedyMove(game): highest-value capture, else
 `components/Fog.jsx` dispatches. Tier 1 (`components/FogLayer.jsx`, one plane
 per square) is kept working as a rollback — do not delete it.
 
-Tier 2 (`components/FogShader.jsx`) drives an 8x8 `DataTexture` mask through a
-single plane over the board. `LinearFilter` on that mask is what turns
-per-square 0/1 into smooth gradients; without it the fog is a visible grid of
-squares.
+Tier 2 (`components/FogShader.jsx`) drives an 8x8 RGBA `DataTexture` mask.
+`LinearFilter` on that mask is what turns per-square 0/1 into smooth gradients;
+without it the fog is a visible grid of squares.
+
+### Крок 12, Section C: the fog is a raymarched volume, and why the flat versions could never work
+
+**Two separate bugs, found in this order. Both were structural, not tuning.**
+
+**C1 — the deep field was a literal constant.** Not "too uniform" — a constant.
+Trace the pre-Крок-12 maths for a settled fogged cell, which is most of the
+fogged area:
+
+```
+ownVisible    = 0.0                      (exactly; only mid-wave is it partial)
+density       = pow(1 - 0, 1.35) = 1.0
+alpha         = smoothstep(0, 0.38, 1.0) * 0.94 = 0.94      <- constant
+colorVariance = 1 - smoothstep(0.38, 1.0, 1.0) = 0
+color         = mix(uColorMid, noisyColor, 0) = uColorMid    <- constant
+```
+
+Three noise fields were computed per pixel on five slices and then **multiplied
+by zero**. Крок 10's "converge on a flat MID deep in the field" decision, plus a
+density that saturates at exactly 1.0, made the deep field a flat `#C4C8C7`
+fill. Same saturated-density trap Крок 11 Section D found for the *boundary
+position*; it was never fixed for the fog's *appearance*.
+
+**C2 — a flat plane cannot have volume.** Крок 11 Section A had replaced five
+real planes at five heights with one plane whose slices fake height via UV
+parallax. Great draw-call win, identical top-down read — but a shape painted
+inside a flat 8x8 rectangle has no vertical extent, so no amount of colour work
+inside that rectangle produces volume. Reported twice as "no volume".
+
+**The fog is now a box, raymarched.** An 8+overhang × `FOG_SLAB_HEIGHT` ×
+8+overhang slab; the fragment shader intersects the view ray with it
+analytically and marches `FOG_MARCH_STEPS` (12) samples through a 3D density
+field with Beer-Lambert extinction. Still **one draw call**. That buys, properly
+rather than as an approximation: a real silhouette (banks visibly rise off the
+board and spill over its rim), real parallax from real geometry, and genuine
+depth accumulation so a grazing path reads thicker than an overhead one.
+
+**The occlusion guarantee is NOT left to the march.** `baseAlpha` is still
+computed from the mask alone — the same expression Крок 10 Section A tuned,
+evaluated at the texel-snapped cell where the view ray crosses the slab's base
+plane — and the final alpha is `max(baseAlpha, volAlpha)`. The volume can only
+ever *raise* alpha, so "you cannot tell a light tile from a dark one under deep
+fog" cannot regress from anything the raymarch does. Do not restructure that
+into a single blended term.
+
+**`baseAlpha` must stay gated by `onBoard`.** The ground UV is clamped to
+`[0,1]`, so without the gate every fragment out in the overhang resolves to some
+board-border square and inherits its full 94% opacity — painting a hard
+rectangular apron of flat grey around the board on all four sides. That is what
+"a translucent plate hovering over the board" looked like, and its cause is the
+clamp, not the march.
+
+#### Two density models that were tried and are dead ends
+
+Both defined a fog **surface** and filled below it
+(`ceiling = base + cloud * billow`, density 1 below, 0 above, soft skin across):
+
+1. `base 0.30`, narrow skin → a slab of ice: flat lid, plus a hard vertical wall
+   wherever the fogged region ended.
+2. `base 0.10`, wide skin → worse: widening the skin to hide the lid just smears
+   partial density through the whole slab, giving a uniform block of haze whose
+   silhouette *is* the bounding box.
+
+"Filled below a surface" models a **solid with a lumpy top**. There is no
+setting of base/billow/skin that turns it into fog. What works is a density
+field with no surface at all:
+
+```
+vertical = pow(1 - h, FOG_VERTICAL_FALLOFF)   // dense on the board, thinning up
+shape    = cloud * vertical * fogAmount * spill
+d        = smoothstep(KNEE, KNEE + SOFT, shape)
+```
+
+The **threshold** is the point: subtracting a floor from a field already
+decaying with height means only the strongest cloud values survive high up, so
+the fog resolves into billows that end at different heights with real *holes*
+between them, and reaches exactly 0 before the slab top so there is no top edge
+to see. Scaling by `fogAmount` makes the bank taper down to nothing at the
+frontier instead of ending in a cliff.
+
+Two sizing mistakes worth not repeating: `FOG_SLAB_HEIGHT 0.55` with
+`FOG_VERTICAL_FALLOFF 1.6` crushed all density into the bottom fifth of the
+slab, so from a shallow camera — where volume should be *most* obvious — the fog
+was a flat tilted sheet of frosted glass. 1.1 and 0.95 give the billows room to
+actually differ in height. The ceiling on slab height is the camera: the
+material is `FrontSide`, so the camera must stay outside the box or the near
+faces get culled and the fog vanishes; shallowest legal camera is y≈3.57, slab
+tops out at 1.12.
+
+Shading, in order of how much it matters: **height in the slab** (light comes
+from above, so a sample's height *is* how much fog is stacked above it absorbing
+that light — crowns bright, base dark; `FOG_DEPTH_SHADE`), then one extra cloud
+sample toward the light for a consistent direction. `FOG_DEPTH_SHADE` is 0.38,
+not the 0.72 first tried: the vertical falloff puts most density at low `h`, so a
+large value darkens the fog's *dominant mass* — at 0.72 the fogged field measured
+mean luma 100 against tiles at 161–198, i.e. the mist had gone darker than the
+board it sits over.
+
+#### The noise lattice must not resonate with the board grid
+
+`FOG_NOISE_SCALE_*` are 1.87 / 3.29 / 10.73 with a 2.11 V-stretch — deliberately
+not round. They were 3.0 / 4.0 / 11.0, and on an 8x8 board sampled through a
+noise texture whose lattice periods are powers of two (4/8/16/32), that resonates:
+`mass` at `vUv * 3.0` gave 3 tiles × 4 cells = 12 lattice cells across 8 squares
+= **1.5 cells per square, which repeats exactly every two squares — the
+checkerboard's own period.** The fog's brightness locked to square parity.
+
+Measured: mean luma of fog over light squares ran **19.1 higher** than over dark
+ones. That is *not* a tile leak — `accum.a` was verified at 0.94–0.96, worth at
+most ~1.9 luma of leak — it was the fog's own noise drawing a grid aligned to the
+board. After the fix: 1.65. `lib/noise.js` already documents this exact class of
+bug for the same reason (lacunarity 2.03, not 2.0); this is the same fix one
+level up.
+
+#### How to actually measure the occlusion guarantee
+
+`tools/fogdiag.mjs`. The light-vs-dark mean comparison is a **useful signal but
+not a valid measurement** — as above, any spatial correlation between the noise
+and square parity shows up in it and looks exactly like a tile leak.
+
+The authoritative test renders once normally, then repaints **every tile a flat
+`#808080`** and renders again, touching nothing else. Whatever the fog hides
+cannot change between the two frames, so per fogged square
+`|luma_before - luma_after|` **is** the leak, independent of where the noise
+happens to sit. Clear squares are the control and must change a lot.
+
+Current: fogged **2.18 luma mean, 4.44 max** against a 6-luma budget
+(`FOG_MAX_ALPHA` 0.94 ⇒ ≤6% leak); clear squares' light/dark delta **37.2**,
+unchanged from before the rework, so no milkiness regression.
+
+`gl.readPixels` returns all zeros unless you `window.__gl.render(...)`
+**synchronously in the same `page.evaluate`** — the context has no
+`preserveDrawingBuffer`, so by the time an ordinary evaluate runs the back buffer
+is already presented and cleared. Same trap as `drawImage`.
+
+`FOG_MARCH_STEPS` replaces `FOG_LAYERS` as the first perf lever — a straight
+linear trade against fragment cost. `FOG_LAYERS`/`FOG_LAYER_ALPHA_MULT` are
+unread by tier 2 now (only `FOG_LAYER_HEIGHTS[0]` survives, as `FOG_HEIGHT`);
+they are kept because tier 1 is the documented rollback.
 
 ### Wisp structure (ridged noise, not fbm)
 
@@ -785,6 +1027,62 @@ Verified with the same forced-`uTime`/`gl.readPixels` method: comparing
 render output across ten different `uTime` values against a fixed baseline
 all showed substantial, non-trivial pixel diffs (1,200-9,000 pixels, colour
 delta up to 225/255) at the frontier band specifically.
+
+### Крок 13: the frontier still read as a clean 8x8 grid, and a genuine occlusion bug
+
+Two separate fixes, both small in diff but worth recording precisely so the
+tuned numbers aren't re-derived from scratch.
+
+**The wobble existed but was too small to read.** Крок 11 Section D's breathing
+and Крок 10 Section D's boil warp were both real and both verified with
+`gl.readPixels`, but their amplitudes (`FOG_BREATH_AMPLITUDE_SLOW/FAST` 0.06/
+0.02, `boil` magnitude 0.07 of a cell in `FogShader.jsx`) only ever moved the
+tested boundary a few percent of a cell off the true mask edge — enough to
+prove the mechanism worked, not enough to visibly break the frontier's
+grid-aligned read. Raised to 0.16/0.05 and 0.15 respectively: still gated to 0
+for `FOG_WAVE_DURATION` after a square's own visibility flips (unchanged, see
+Крок 11 Section D above), so a bigger wobble still never fights an in-flight
+reveal/conceal wave — only the steady-state amplitude changed.
+`FOG_MARCH_STEPS` also went 12 -> 16 for finer volumetric step resolution, and
+`cloudField`'s mass/wisps mix nudged from 0.74/0.26 to 0.70/0.30 for a touch
+more visible wisp detail, per the same "трішки деталей" ask. `FOG_MARCH_STEPS`
+is still the first lever to pull back down if a real GPU ever shows this is
+too expensive — see "Headless browser" below; none of this was measurable
+from this environment beyond "it still renders and passes `tools/fogdiag.mjs`'s
+occlusion budget."
+
+**A genuine bug, not a tuning gap: an own piece's move animation could get
+hidden behind the fog mid-flight.** `Pieces.jsx` animates a move as a straight
+lerp from the old square to the new one, arcing up to `MOVE_ARC_HEIGHT` (0.32)
+at the midpoint — and "a square holding your own piece is never fogged" (see
+"The fog's base layer..." above) was only ever being applied to the piece's
+*resting* square. A slide across several ranks/files (a queen d1-d8, say)
+visibly flies over whatever squares sit between, and those can be genuinely
+fogged — outside `visibility`, no piece of yours currently attacks or occupies
+them. `FogShader` has no notion that a piece is passing overhead: it marches
+real volumetric density there, and because the fog box's own near surface
+(typically its top, at `FOG_HEIGHT + FOG_SLAB_HEIGHT`) is geometrically nearer
+an overhead camera than a piece flying below the slab top, the fragment isn't
+discarded and paints straight over the piece for that instant. Reported as
+"fog jumps in front of and covers a piece."
+
+Fixed in `GameCanvas.jsx`, not in the shader: `squaresBetween(from, to)`
+(`lib/fog.js`) computes the straight rank/file/diagonal path between a move's
+two squares (a knight's hop isn't collinear, so it just returns the two
+endpoints — a knight's brief in-air flicker is accepted as an edge case, not
+worth a curved-path special case for a ~0.35s animation). Whenever the most
+recent move is White's own, those squares are temporarily unioned into the
+`visibility` Set passed to `<Fog>` **only** — never to `<Pieces>`, which stays
+strictly game-accurate — for `MOVE_DURATION` (now exported from `Pieces.jsx`)
+seconds, via a plain `setTimeout`. Because this flows through the same
+`visibility`-diffing wave-scheduling effect Крок 10 Section C already has, the
+fog doesn't just stop rendering over the path — it visibly parts (a reveal
+wave) and then closes back in (a conceal wave) a beat after the piece lands,
+which reads as an intentional effect rather than a hidden hack. Enemy piece
+reveals deliberately do **not** get the same exemption: an enemy piece only
+starts rendering once its destination square is already visible, and it's
+fine for its arrival animation to flicker under fog along a path the player
+never had eyes on anyway.
 
 ## Camera and environment
 
@@ -1201,7 +1499,80 @@ comment. If that shot reads as floating in open void rather than pushing low
 across a landscape, it needs revisiting once the real rock model (or even
 just the temporary pedestal) has been checked from that exact angle.
 
-**Крок 11, Section C colours the rock.** Inspecting the glTF JSON directly
+### Крок 12, Sections B & D: the rock wears its own texture, and the board actually fits
+
+**D — use Mint's baked maps; stop guessing at contours.** Крок 11 Section C
+(below) replaced Mint's material with procedural granite plus a *geometric*
+foliage guess: green where `radius > 0.6..0.8 * maxRadius` **and** `height >
+0.5..0.65`. That guess failed in the most visible way possible — a basin's raised
+rim is by construction both high and at large radius, so the mask fired across
+the entire rim and **the whole formation rendered as one flat green bowl**, with
+the stone gradient never visible at all.
+
+There was never a need to guess. The `.glb`'s own JSON chunk shows the material
+carries three baked textures the old code threw away:
+`baseColorTexture` (webp via `EXT_texture_webp` — grey granite, **green foliage
+on the pine canopies, brown bark on the trunks**, exactly what the brief asks
+for, already authored), `normalTexture`, `metallicRoughnessTexture`.
+`RockIsland.jsx` now keeps the loaded material's maps and overrides only the
+response. Two consequences: `flatShading` must be **off** (it fights the normal
+map and destroys the baked detail), and `side` is forced to `FrontSide` because
+Mint marks the material `doubleSided`, which shades every covered pixel twice on
+the largest object on screen. The brief's fallback ("if you can't see the
+contours, just paint it all grey") is not needed — the contours are in the
+texture, not the geometry.
+
+The rock keeps `TEXCOORD_0` and its textures through decimation, and gets a
+gentler ratio (30,000 tris) than the pieces: it is one instance rather than 32,
+it is the largest object on screen by area, and it is the only model whose
+silhouette is seen against open sky at every orbit angle.
+
+**B — the board was fitted to a radius, but a board is a square.** The old
+`ROCK_SCALE` put the basin floor's *flat radius* (0.65 local) at
+`BOARD_HALF_WIDTH * 1.1`. A square of half-width `s` reaches `s*√2` at its
+corners, so fitting the half-width to a radius leaves the four corners hanging
+over whatever lies between `s` and `1.414*s` — which is where the rim is.
+
+`tools/measure-rock.mjs` measures it properly. It **rasterises the model's
+triangles** into a 128×128 top-surface heightfield rather than binning vertices:
+vertex binning reports narrow floor cracks as ~1-unit-deep holes, so the "spread"
+over any footprint is dominated by that artifact and the numbers look confident
+and are wrong. Counting cells that poke >0.01 above the basin floor inside a
+square footprint of half-width `s`:
+
+| s | maxTopY | cells above floor |
+|---|---|---|
+| 0.450 | 0.417 | 0 |
+| **0.475** | **0.417** | **0** ← last fully clean footprint |
+| 0.500 | 0.460 | 2 |
+| 0.591 | 0.469 | ~380 ← what the old ROCK_SCALE produced |
+| 0.675 | 0.718 | 1125 |
+
+At the old effective `s` of 0.591, ~380 cells of rock stood above the basin floor
+*inside the board's own footprint*, by up to 0.052 local = 0.38 world units —
+more than the board slab's 0.30 thickness, so rock genuinely pushed up past the
+playing surface at the edges. `ROCK_FIT_HALF_WIDTH` is now 0.46.
+
+**Y is scaled separately from XZ, on purpose.** Widening the footprint 28% to
+seat the board would have raised the rim and pines by the same 28%, taking the rim
+from y=+2.85 to +3.75 — and the shallowest legal camera sits at
+`11.55*cos(72°) = 3.57`, i.e. *below* the rim, looking at the outside of the bowl
+instead of across the board. Holding `ROCK_SCALE_Y` at the previous 7.277 keeps
+every height exactly where the existing camera clamps were verified, so this
+cannot reopen that question: the rock just becomes a wider, shallower bowl. On an
+irregular formation the anisotropy is not readable as one.
+
+Verified from overhead and from a low corner azimuth: all four corners sit on the
+flat floor with even margin, nothing intrudes over the board.
+
+The fog's 1.0-unit overhang (see "Fog" above) also finally delivers the thing
+Крок 10 Section E listed as not attempted — fog visibly spilling over the rock's
+outer rim, hiding where it drops off. Board UVs outside 0..1 land on the mask's
+`ClampToEdge` border, so the spill inherits the fogged-ness of whichever border
+square it flows off, correctly and for free.
+
+**Крок 11, Section C colours the rock.** *(Superseded by Section D above — kept
+for the reasoning about single-mesh models.)* Inspecting the glTF JSON directly
 (reading `meshes`/`materials` out of the `.glb`'s own JSON chunk — no loader
 needed) confirmed one mesh, one material: the "все одним мешем" case, not a
 per-part material swap. `ROCK_MATERIAL.onBeforeCompile` injects a geometry
@@ -1287,7 +1658,36 @@ React state" pattern the crossfade and the hover-lift both use. That DOM node
 crossing the React-DOM/R3F boundary through a plain ref is fine, it's still
 just a ref.
 
-### Reusing the real fog-of-war instead of mocking it
+### Крок 12, Section B: NO FOG ON THE INTRO
+
+The intro used to run the real fog-of-war machinery with a per-shot `visibility`
+Set (`introVisibilityFor`, now gone). That architecture — reuse the mechanic
+rather than mock it — is still right and is not what changed. The *brief*
+changed: the loading/intro screen should not be under fog at all. It is the first
+thing anyone sees, and three shots of a near-uniform grey sheet is a bad first
+frame that hides the board, the pieces, and the rock the whole composition rests
+on.
+
+So during `'intro'` and `'transitioning'`, `showFog` is false and the `Fog` mesh
+is **not mounted**, while `visibility` is `ALL_VISIBLE`. **Both halves matter.**
+Dropping the fog alone would leave `Pieces`' own rule in force ("an enemy piece
+outside `visibility` is not rendered"), so Black's entire side would simply be
+missing from the intro — an empty half-board with nothing covering it, which
+reads worse than the fog did.
+
+Not mounting the mesh (rather than mounting it with a full-visibility mask) also
+means the first fog the player ever sees is a freshly-mounted mask settling into
+the real starting position, not a 64-square dissolve firing on the hand-off frame.
+
+`IntroCameraRig`'s `onFrameIndexChange` is now optional and unconsumed; it is
+kept as a hook since "which shot is on screen" is the natural key for a future
+per-shot effect.
+
+The subsection below describes the superseded per-shot fog approach. Frame 0's
+"фігур майже не видно, тільки силуети" is no longer what happens — the intro shows
+the complete set on a clear board.
+
+### Reusing the real fog-of-war instead of mocking it *(superseded — see above)*
 
 The three shots don't get a separate, hand-authored "looks foggy" scene —
 `GameCanvas.jsx` feeds `Fog` and `Pieces` a different `visibility` Set
@@ -1396,9 +1796,35 @@ the entire reason the intro doesn't cost a second load.
 
 ## QA hooks
 
+### `tools/` — checked-in measurement scripts (Крок 12)
+
+These encode how the fog and rock numbers above were derived, so they can be
+re-run against a regenerated asset instead of re-derived from scratch. They need
+dev-only packages that are **not** in `package.json` — install them together in
+one command, because `npm install --no-save X` re-resolves from `package.json`
+and **prunes** anything installed by a previous `--no-save` call:
+
+```
+npm install --no-save @gltf-transform/core @gltf-transform/extensions \
+  @gltf-transform/functions meshoptimizer draco3dgltf playwright
+```
+
+| script | what it does |
+|---|---|
+| `decimate-models.mjs` | the asset budget fix. Dry run by default, `--write` applies. Refuses to run twice. |
+| `measure-rock.mjs` | triangle-rasterised top-surface heightfield → the basin floor fit table |
+| `diagnose-mesh.mjs` | why a mesh won't simplify: component count, boundary/non-manifold edges |
+| `sweep-simplify.mjs` | which meshopt flags unlock a given mesh |
+| `shoot.mjs` | screenshots at named camera placements (`shot=shallow\|overhead\|corner\|far\|behind`, `--intro`) |
+| `probe.mjs` | live world-space AABBs of the big meshes, for "does X actually fit Y" |
+| `fogdiag.mjs` | the fog occlusion test + parity stats + dumps the generated fragment shader |
+| `check-mask.mjs` | shoots `/dev-fog?visible=` for a1/b1/g8/c6 — the mask-orientation check |
+
+Output goes to `tools/shots/`, which is gitignored.
+
 - `npm test` — Node's built-in runner, no extra deps. Asserts the starting
   position gives White exactly 24 visible squares and that pawns do not leak
-  their push-square into vision.
+  their push-square into vision. 11 tests, all passing after this pass.
 - `?fen=<FEN>` on the game page loads a position directly (`useChessGame`
   accepts an optional initial FEN). The random-moving AI will never reach mate
   or stalemate on its own, so this is how the checkmate/draw HUD states get
@@ -1484,11 +1910,18 @@ verify:
   same session — pass an explicit longer `timeout` rather than assuming a
   timeout means the page hung.
 
-Real-GPU performance cannot be measured from here. The fog shader is the thing
-to watch if it ever needs profiling: one fbm plus two ridged-noise evaluations
-(five octaves each) per pixel, across two stacked sheets — the same order of
-cost as the fbm-plus-domain-warp version it replaced, not a new regression on
-its face, but unverified on real hardware.
+Real-GPU frame rate cannot be measured from here — the `?debug=1` `FpsCounter`
+reads 60 in this environment regardless, so do not trust a number reported from
+it. **What can be measured from here is geometry and draw calls**, via
+`window.__scene` traversal and `gl.info` (see `tools/shoot.mjs`), and after Крок
+12 that is where the real win was: 8,502,106 → 160,102 triangles per pass. Read
+"Asset budget" — the scene was geometry-bound by two orders of magnitude, which
+is not something a shader-cost estimate would ever have surfaced.
+
+If the fog shader does need profiling, `FOG_MARCH_STEPS` is the lever and it is a
+straight linear trade. Per pixel the march is ~12 mask fetches plus ~12–24 noise
+fetches, against ~24 for the five-slice version it replaced — comparable, still
+one draw call, and still unverified on real hardware.
 
 ## Dev-server gotcha
 
