@@ -715,11 +715,15 @@ a 404 and would hang the entire canvas behind Suspense.
 foreground, 2560x1429, 434 KB. The 2752x1536 / 6.6 MB original lives in
 `assets-src/` and is **not** under `public/`, so it never ships.
 
-It is **one frame, not a seamless 360 panorama.** It is therefore mapped onto a
-cylinder *segment* and `OrbitControls` is clamped to a sector where the open
-ends stay off screen (`AZIMUTH_LIMITS` in GameCanvas, from `HOME_AZIMUTH` +/-
-`AZIMUTH_SWING` = 30 degrees). A narrow sector with a good frame beats a full
-orbit with a visible seam. Procedural mode keeps the full 360.
+It is **one frame, not a seamless 360 panorama**, so it's mapped onto a
+cylinder *segment*, not a full wraparound cylinder. `AZIMUTH_SWING` (still
+exported from `Backdrop.jsx`) is a leftover from when `OrbitControls` used to
+be clamped to keep the segment's open ends off screen — azimuth has been
+unclamped since SkyDome shipped (see "Camera and environment"), and since
+Крок 9.5 Section B a *second* segment covers the rest of the circle (see
+"Multiple segments (Крок 9.5, Section B)" below), so nothing reads that
+export anymore. It's dead, not dangerous; left alone rather than cleaned up
+as part of an unrelated change.
 
 **The framing is derived, not eyeballed** — same method as the procedural
 shells, and the derivation is the only reason it sits right:
@@ -752,6 +756,68 @@ without either zooming the painting hard or breaking its aspect. The plateau is
 what covers it. That is a real coupling between the two sections: **if you turn
 `SHOW_PLATEAU` off, the painting's lower edge becomes visible at the bottom of
 the frame.**
+
+### Multiple segments (Крок 9.5, Section B)
+
+A single 200-degree segment left ~160 degrees of a full orbit showing open
+`SkyDome` with nothing painted in it — azimuth has been unclamped since
+SkyDome shipped (Крок 8), so that gap was always reachable, just not always
+dressed. `BACKDROP_SEGMENTS` in `Backdrop.jsx` is the fix: an array of `{id,
+src, azimuth, arcDeg, flip}`, one entry per painted cylinder segment, each
+independently placed and each fading into `SkyDome` (or another overlapping
+segment) at its own edges through the *same* `getBackdropEdgeAlphaMap`
+mechanism the original single segment already had. `Backdrop()` maps over the
+array and renders one `<ImageBackdropSegment>` per entry; nothing about the
+per-segment geometry math changed from the original single-segment version
+(`ImageBackdropSegment` is the old `ImageBackdrop`, parametrised by `segment`
+instead of hardcoding one azimuth/arc/flip) — only `azimuth` is new: it's the
+segment's own centre, in place of the old hardcoded `HOME_AZIMUTH - Math.PI`.
+
+**Segments are plain alpha-blended transparent meshes, so an overlap is just
+two fading edges compositing on top of each other** — not a seam that needs
+solving. Verified by sweeping the camera through 8 azimuths 45 degrees apart:
+mountains at every angle, no gap, no hard edge.
+
+**Today's two segments are both the same painting** (`BACKDROP_IMAGE`) —
+`valley-main` at its original azimuth, `valley-mirror-placeholder` rotated
+180 degrees and with the opposite `flip`, which is what makes it read as a
+mirrored variant rather than the identical frame pasted twice. This already
+closes the circle completely: two 200-degree arcs (+/-100 from their own
+centre) placed 180 degrees apart overlap by ~20 degrees on each side, so
+every azimuth falls inside at least one segment. It's a stand-in for two more
+Mint-generated frames of the same valley, not a placeholder for any specific
+future segment — replacing it is a matter of swapping `src`/`azimuth`/`arcDeg`
+on that array entry (and adding a third for the brief's eventual "three
+~140-degree segments with overlap"), nothing structural.
+
+**Cloning the texture per segment is load-bearing, not decoration.**
+`useTexture` (drei) caches by URL through r3f's loader cache — two segments
+that reference the same `src` get back the exact same `THREE.Texture`
+instance, not two independent ones. Since each segment needs its own
+`repeat.x`/`offset.x` (the main segment is U-flipped, the mirror placeholder
+deliberately isn't), mutating the shared instance directly would make
+whichever segment's effect ran last win for *both* of them — the mirror
+would either not be a mirror, or the main segment would lose its correct
+orientation, depending on render order. `ImageBackdropSegment` clones the
+texture once per instance (`rawTexture.clone()`) specifically to give each
+segment independent `wrapS`/`wrapT`/`repeat`/`offset` while still sharing the
+one decoded image (no second fetch, no second decode) — and disposes its own
+clone on unmount, leaving the cached original alone for the other segment (or
+a future remount) to clone again.
+
+**The readiness probe is all-or-nothing across every segment's `src`.** A
+partial state — some segments showing the painting, others falling back to
+procedural `Mountains` — would read as two different worlds stitched
+together, worse than a full fallback. `Backdrop()` HEAD-probes the set of
+*unique* `src` values (one request today, since both segments share a
+source) and only mounts any image segments once all of them resolve; if any
+fails, every segment falls back to `Mountains` together.
+
+`?bdr=` `?bda=` `?bdt=` `?bde=` `?bdflip=` still work and now apply to every
+segment at once (each falls back to its own config value when a given
+override isn't present in the URL) — useful for sweeping radius/arc/skyline
+across the whole array while tuning, not for pointing at one segment
+individually.
 
 ## Gaussian splat backdrop (`BACKDROP_MODE = 'splat'`) — wired, not yet placed
 

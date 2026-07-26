@@ -84,6 +84,66 @@ export const HOME_AZIMUTH = Math.atan2(3.5, -8.5);
 export const AZIMUTH_SWING = THREE.MathUtils.degToRad(30);
 
 /*
+ * Крок 9.5, Section B: the painting only ever covered ~200 of 360 degrees
+ * (see ARC_DEG above); the rest of a full orbit showed open SkyDome with
+ * nothing painted in it. Azimuth has been unclamped since SkyDome shipped
+ * (see "Camera and environment" in CLAUDE.md), so a full orbit was always
+ * reachable — it just wasn't always dressed.
+ *
+ * BACKDROP_SEGMENTS is the fix: one entry per painted cylinder segment, each
+ * independently placed by its own `azimuth` (segment centre) and `arcDeg`,
+ * each fading into SkyDome at its own edges through the same edge-alpha
+ * mechanism the original single segment already had (getBackdropEdgeAlphaMap
+ * in proceduralTextures.js). Segments are ordinary alpha-blended transparent
+ * meshes, so where two overlap it's just two fading edges compositing on top
+ * of each other — not a seam to solve for, per the brief.
+ *
+ * Two segments today, both the *same* painting (`BACKDROP_IMAGE`) — one at
+ * its natural azimuth, one rotated 180 degrees and mirrored the other way —
+ * are the temporary stand-in the brief asked for while a second Mint frame
+ * doesn't exist yet. It already fully closes the circle: each arc is 200
+ * degrees (+/-100 from its own centre), the two centres are 180 degrees
+ * apart, so segment A's far edge (its centre +100) lands 20 degrees past
+ * segment B's near edge (its centre -100) — every azimuth falls inside at
+ * least one of the two, with two ~20-degree bands (near each pair of edges)
+ * inside both. Heavy fog and the edge fades on both sides make the repeated,
+ * mirrored painting hard to spot in practice.
+ *
+ * The real fix is swapping in two more Mint-generated frames of the same
+ * valley and moving ARC_DEG-per-segment toward the brief's ~140 degrees each
+ * with the same overlap logic — nothing about this array's *shape* needs to
+ * change for that, only its contents (see the TODO comment on the second
+ * entry below).
+ */
+export const BACKDROP_SEGMENTS = [
+  {
+    id: 'valley-main',
+    src: BACKDROP_IMAGE,
+    // The direction the camera looks at rest (see ImageBackdropSegment's old
+    // `center` derivation, now per-segment) — unchanged from before this
+    // section existed, so the default view is pixel-identical to Крок 8.
+    azimuth: HOME_AZIMUTH - Math.PI,
+    arcDeg: ARC_DEG,
+    flip: true,
+  },
+  {
+    // TODO(when a second Mint frame exists): replace `src` with it, and
+    // retune `azimuth`/`arcDeg` (and the third segment alongside it) toward
+    // three ~140-degree arcs with overlap, per the brief. Until then this is
+    // not a placeholder for any *specific* future segment — just enough
+    // cover that a full orbit never shows open dome.
+    id: 'valley-mirror-placeholder',
+    src: BACKDROP_IMAGE,
+    azimuth: HOME_AZIMUTH,
+    arcDeg: ARC_DEG,
+    // Opposite of the main segment's flip: combined with the 180-degree
+    // azimuth offset above, this is "rotated and mirrored" per the brief,
+    // not just "the same frame pasted on the other side."
+    flip: false,
+  },
+];
+
+/*
  * Fog ranges are mode-dependent: the procedural shells live at r<=36 and are
  * built to be eaten by fog, the painting sits at r=46 and must survive it.
  * In image mode the range starts past the board (so pieces stay crisp) and
@@ -117,8 +177,25 @@ function readTuning() {
   };
 }
 
-function ImageBackdrop({ src, tuning }) {
-  const texture = useTexture(src);
+/**
+ * One painted cylinder segment. `segment` is one entry from
+ * BACKDROP_SEGMENTS; `tuning` is the shared `?bdr=`/`?bda=`/etc URL overrides
+ * (see readTuning below), applied on top of every segment alike so a single
+ * URL can still sweep radius/arc/skyline across all of them at once.
+ */
+function ImageBackdropSegment({ segment, tuning }) {
+  const rawTexture = useTexture(segment.src);
+  /*
+   * Every segment that shares a `src` (both do today — see BACKDROP_SEGMENTS)
+   * gets back the *same* Texture instance from useTexture: r3f's loader cache
+   * is keyed by URL, not by call site. Mutating .repeat/.offset on that
+   * shared object per-segment would make each segment's flip setting stomp
+   * the others' — whichever segment's effect ran last would win for all of
+   * them. Cloning gives this segment its own wrapS/wrapT/repeat/offset while
+   * still sharing the decoded image data (no second network fetch, no second
+   * decode).
+   */
+  const texture = useMemo(() => rawTexture.clone(), [rawTexture]);
 
   /*
    * The eye the framing is solved against is CameraRig's *resting* position for
@@ -137,16 +214,23 @@ function ImageBackdrop({ src, tuning }) {
 
   const geo = useMemo(() => {
     const radius = tuning.radius ?? RADIUS;
-    const arc = THREE.MathUtils.degToRad(tuning.arcDeg ?? ARC_DEG);
+    const arc = THREE.MathUtils.degToRad(tuning.arcDeg ?? segment.arcDeg);
     const height = (radius * arc) / IMAGE_ASPECT;
     const elevation = THREE.MathUtils.degToRad(tuning.elevation ?? SKYLINE_ELEVATION_DEG);
     const skylineY = eyeY - (radius + eyeRadius) * Math.tan(elevation);
     const topY = tuning.topY ?? skylineY + SKYLINE_FRACTION * height;
-    // The segment is centred on the direction the camera looks, i.e. opposite
-    // its home azimuth. thetaStart is the segment's leading edge.
-    const center = HOME_AZIMUTH - Math.PI;
-    return { radius, arc, height, centerY: topY - height / 2, thetaStart: center - arc / 2 };
-  }, [tuning, eyeY, eyeRadius]);
+    // thetaStart is the segment's leading edge, derived from its own centre
+    // azimuth rather than always the camera's home direction — this is what
+    // lets segments sit anywhere around the circle, not just opposite the
+    // player's resting view.
+    return {
+      radius,
+      arc,
+      height,
+      centerY: topY - height / 2,
+      thetaStart: segment.azimuth - arc / 2,
+    };
+  }, [tuning, eyeY, eyeRadius, segment.arcDeg, segment.azimuth]);
 
   useEffect(() => {
     texture.colorSpace = THREE.SRGBColorSpace;
@@ -155,13 +239,19 @@ function ImageBackdrop({ src, tuning }) {
     texture.wrapT = THREE.ClampToEdgeWrapping;
     // Seen from BackSide the cylinder's u axis runs right-to-left on screen,
     // which mirrors the painting. Flipping u puts it back the way it was
-    // painted (pines on the left, the big cliff on the right).
-    if (tuning.flip ?? true) {
-      texture.repeat.x = -1;
-      texture.offset.x = 1;
-    }
+    // painted (pines on the left, the big cliff on the right) — each segment
+    // picks its own default via `segment.flip`, since the temporary mirrored
+    // placeholder segment deliberately wants the *other* orientation.
+    const flip = tuning.flip ?? segment.flip;
+    texture.repeat.x = flip ? -1 : 1;
+    texture.offset.x = flip ? 1 : 0;
     texture.needsUpdate = true;
-  }, [texture, tuning.flip]);
+  }, [texture, tuning.flip, segment.flip]);
+
+  // Disposing the clone releases only this segment's own GPU texture object;
+  // the decoded image data and the cached original stay alive for the other
+  // segment (or a future remount) to clone again.
+  useEffect(() => () => texture.dispose(), [texture]);
 
   const edgeAlpha = useMemo(getBackdropEdgeAlphaMap, []);
 
@@ -177,10 +267,10 @@ function ImageBackdrop({ src, tuning }) {
           fixed-shape fade below.
 
           alphaMap dissolves the painting into whatever is now behind it — the
-          SkyDome — on all four sides: both azimuth edges and the bottom, so
-          there is no seam at any camera position, not just inside the old
-          azimuth clamp. transparent has to be explicit; alphaMap does nothing
-          without it. */}
+          SkyDome, or another overlapping segment — on all four sides: both
+          azimuth edges and the bottom, so there is no seam at any camera
+          position and overlapping segments simply composite. transparent has
+          to be explicit; alphaMap does nothing without it. */}
       <meshBasicMaterial
         map={texture}
         alphaMap={edgeAlpha}
@@ -194,17 +284,28 @@ function ImageBackdrop({ src, tuning }) {
 }
 
 export default function Backdrop() {
-  // Probe for the file before mounting the texture loader: useTexture suspends
-  // forever on a 404, which would hang the whole canvas behind Suspense.
-  const [imageReady, setImageReady] = useState(false);
+  // Probe for every distinct image the segments reference before mounting
+  // any texture loader: useTexture suspends forever on a 404, which would
+  // hang the whole canvas behind Suspense. Both segments share one `src`
+  // today, so this is one request, but it's written against the general
+  // case (Set of unique srcs) so a future segment with its own Mint frame
+  // doesn't need this rewritten too.
+  //
+  // Gated all-or-nothing: if any segment's image isn't ready, every segment
+  // falls back to Mountains together rather than mixing a painted arc with
+  // procedural ridges elsewhere in the same 360 — those two read as
+  // different worlds, so a partial mix would look more broken than a full
+  // fallback.
+  const [imagesReady, setImagesReady] = useState(false);
   const tuning = useMemo(readTuning, []);
 
   useEffect(() => {
     if (!USES_PAINTING) return undefined;
     let cancelled = false;
-    fetch(BACKDROP_IMAGE, { method: 'HEAD' })
-      .then((r) => !cancelled && setImageReady(r.ok))
-      .catch(() => !cancelled && setImageReady(false));
+    const srcs = [...new Set(BACKDROP_SEGMENTS.map((s) => s.src))];
+    Promise.all(srcs.map((src) => fetch(src, { method: 'HEAD' }).then((r) => r.ok)))
+      .then((oks) => !cancelled && setImagesReady(oks.every(Boolean)))
+      .catch(() => !cancelled && setImagesReady(false));
     return () => {
       cancelled = true;
     };
@@ -222,13 +323,19 @@ export default function Backdrop() {
   return (
     <>
       {/* Mounted first and unconditionally: it is what closes the scene on
-          every azimuth, so the painted segment (one frame, not a panorama) has
-          somewhere to dissolve into instead of an edge or open canvas. Ordinary
-          depth testing puts it behind everything else without any renderOrder
-          bookkeeping — it is opaque and by far the largest thing in the
-          scene. */}
+          every azimuth, so every painted segment (each one frame, not a
+          panorama) has somewhere to dissolve into instead of an edge or open
+          canvas. Ordinary depth testing puts it behind everything else
+          without any renderOrder bookkeeping — it is opaque and by far the
+          largest thing in the scene. */}
       <SkyDome />
-      {imageReady ? <ImageBackdrop src={BACKDROP_IMAGE} tuning={tuning} /> : <Mountains />}
+      {imagesReady ? (
+        BACKDROP_SEGMENTS.map((segment) => (
+          <ImageBackdropSegment key={segment.id} segment={segment} tuning={tuning} />
+        ))
+      ) : (
+        <Mountains />
+      )}
       {/* Mounted on top of the painting, not instead of it. 32 MB takes a while
           and may not arrive at all; the painted cylinder is the floor under it
           and costs 434 KB. */}
