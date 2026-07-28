@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from 'react';
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { useThree } from '@react-three/fiber';
 import { useTexture } from '@react-three/drei';
@@ -6,6 +6,10 @@ import Mountains from './Mountains';
 import SkyDome, { DOME_HORIZON_COLOR } from './SkyDome';
 import { getBackdropEdgeAlphaMap } from './proceduralTextures';
 import { basePositionFor } from './CameraRig';
+import { THEMES, themeKeyFromUrl } from '../lib/themes';
+
+const ACTIVE_THEME_KEY = themeKeyFromUrl();
+const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
 
 /*
  * Lazy, not a static import. @sparkjsdev/spark is 482 KB in the client bundle —
@@ -15,6 +19,27 @@ import { basePositionFor } from './CameraRig';
  * fetched if something actually renders it.
  */
 const SplatBackdrop = lazy(() => import('./SplatBackdrop'));
+
+/*
+ * Крок 17: a backdrop splat is a 1.9M-splat point cloud sorted every frame in
+ * WASM plus a heavy fragment cost — the exact kind of workload mobile GPUs
+ * and their thinner memory/bandwidth budgets are worst at, and this
+ * environment has no way to measure that directly (see CLAUDE.md's "Headless
+ * browser" section — a single splat frame costs 100+ seconds here regardless
+ * of viewport size, so it cannot stand in for a real device). Rather than
+ * ship an unverified guess at "will this hit 60fps on a phone", narrow-
+ * viewport/coarse-pointer devices skip the splat entirely and always get
+ * whatever fast fallback is already mounted underneath (the painted cylinder
+ * for Mist, the procedural Mountains shells for Ocean/Snow) — both already
+ * proven cheap (~160K triangles total scene, see "Asset budget" in
+ * CLAUDE.md). Same matchMedia check as GameCanvas.jsx's isLowPowerDevice/
+ * FogShader.jsx's marchStepsForDevice/Lighting.jsx's own copy; duplicated
+ * locally per this codebase's established convention rather than shared.
+ */
+function isLowPowerDevice() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
+}
 
 /**
  * 'procedural' — the canvas-generated ridge shells in Mountains.jsx.
@@ -31,11 +56,44 @@ const SplatBackdrop = lazy(() => import('./SplatBackdrop'));
  * measured off the file and the URL knobs for dialling it in live. Flip this to
  * 'splat' and tune it in a real browser; it needs a GPU and an eye, not a
  * headless screenshot.
+ *
+ * Крок 13: this constant is scoped to MIST's own content now, not a global
+ * switch — ocean/snow have no painted valley panorama of their own, so any
+ * theme other than mist always renders the procedural Mountains shells as its
+ * base (see IS_MIST/USES_PAINTING below), independent of this value. A
+ * theme's own splat (THEMES[key].backdrop, lib/themes.js) is a separate
+ * concern layered on top of that base — see USES_THEME_SPLAT.
+ *
+ * Крок 17: tried flipping this to 'splat' again — Mist's own capture had
+ * already been attempted and abandoned three times before this project's
+ * theme system even existed (see "What was tried and rejected" further down
+ * this file's history / CLAUDE.md's Gaussian splat section: scale 12, scale
+ * 2, scale 1, all rejected). This capture's own measured extent is already
+ * Y-up (unlike snow's, which needed the rotX -90 Z-up correction — applying
+ * that same fix here was itself wrong and produced a sideways wall, not a
+ * misapplied-but-close attempt), so two further reasoned placements were
+ * tried this pass (identity rotation, two different scale/offset pairs
+ * aimed at the capture's own documented open-ground region) — both still
+ * read as cluttered/buried rather than a clean vista below the island.
+ * Reverted to 'image' rather than spend more time on a capture this
+ * project's own history already flags as difficult to place. If a future
+ * session wants another attempt, do it live in a real browser with `?sp*=`
+ * overrides — this is exactly the kind of placement CLAUDE.md already warns
+ * cannot be judged from a headless screenshot.
  */
 export const BACKDROP_MODE = 'image';
 
-/** True for any mode that puts the painted cylinder in the scene. */
-const USES_PAINTING = BACKDROP_MODE === 'image' || BACKDROP_MODE === 'splat';
+const IS_MIST = ACTIVE_THEME_KEY === 'mist';
+/** True for any mode that puts MIST's own painted cylinder in the scene. */
+const USES_PAINTING = IS_MIST && (BACKDROP_MODE === 'image' || BACKDROP_MODE === 'splat');
+// Крок 17: computed once at module load (this file is only ever imported
+// client-side, same as ACTIVE_THEME_KEY above) — a phone/coarse-pointer
+// device never mounts a backdrop splat for any theme, full stop.
+const IS_LOW_POWER = isLowPowerDevice();
+const USES_MIST_SPLAT = IS_MIST && BACKDROP_MODE === 'splat' && !IS_LOW_POWER;
+// Крок 13: snow's own splat (public/ink-wash-snow-plateau-*.spz), independent
+// of Mist's BACKDROP_MODE rollback knob above.
+const USES_THEME_SPLAT = ACTIVE_THEME.backdrop.mode === 'splat' && !IS_LOW_POWER;
 
 export const BACKDROP_IMAGE = '/textures/mountains.jpg';
 
@@ -285,6 +343,43 @@ function ImageBackdropSegment({ segment, tuning }) {
   );
 }
 
+/*
+ * Крок 13: the brief's own budget for a theme splat — 4 seconds from mount to
+ * first ready frame, measured on production with a cold cache. Not met here:
+ * this environment's headless renderer cannot produce a real timing (see
+ * CLAUDE.md's "Headless browser" section — it runs at ~1fps regardless of
+ * payload), so this is the mechanism, unverified against a real device. If
+ * `window.__splat` never reaches `state: 'ready'` within this window, the
+ * splat is abandoned and the procedural Mountains floor (already mounted
+ * underneath — see the non-painting branch below) is what stays on screen.
+ */
+const SPLAT_LOAD_BUDGET_MS = 4000;
+
+function ThemedSplatBackdrop({ url, defaults }) {
+  const [timedOut, setTimedOut] = useState(false);
+  const readyRef = useRef(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!readyRef.current) setTimedOut(true);
+    }, SPLAT_LOAD_BUDGET_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  if (timedOut) return null;
+  return (
+    <Suspense fallback={null}>
+      <SplatBackdrop
+        url={url}
+        defaults={defaults}
+        onReady={() => {
+          readyRef.current = true;
+        }}
+      />
+    </Suspense>
+  );
+}
+
 export default function Backdrop() {
   // Probe for every distinct image the segments reference before mounting
   // any texture loader: useTexture suspends forever on a 404, which would
@@ -318,6 +413,13 @@ export default function Backdrop() {
       <>
         <SkyDome />
         <Mountains />
+        {/* Крок 13: a theme's own splat (currently only snow — see
+            THEMES.snow.backdrop in lib/themes.js) renders in addition to the
+            procedural floor above, never instead of it — same "never throw
+            upward" contract Mist's own splat already established. */}
+        {USES_THEME_SPLAT && (
+          <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
+        )}
       </>
     );
   }
@@ -341,10 +443,8 @@ export default function Backdrop() {
       {/* Mounted on top of the painting, not instead of it. 32 MB takes a while
           and may not arrive at all; the painted cylinder is the floor under it
           and costs 434 KB. */}
-      {BACKDROP_MODE === 'splat' && (
-        <Suspense fallback={null}>
-          <SplatBackdrop />
-        </Suspense>
+      {USES_MIST_SPLAT && (
+        <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
       )}
     </>
   );

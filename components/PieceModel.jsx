@@ -1,7 +1,15 @@
 import { useMemo } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
-import { PIECE_CONFIG, PIECE_SCALE } from '../lib/pieces';
+import { PIECE_HEIGHTS, PIECE_SCALE } from '../lib/pieces';
+import { THEMES, themeKeyFromUrl, pieceModelPath } from '../lib/themes';
+
+// Крок 13: read once at module load, same convention as BONE_OVERRIDE below
+// and Backdrop.jsx's readTuning — a live in-session theme switch isn't a
+// requirement here, just picking the right asset set and palette for the
+// page's own URL.
+const ACTIVE_THEME_KEY = themeKeyFromUrl();
+const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
 
 // A little metalness is what lets the environment map put highlights on the
 // facets — without it the lacquer reads as matte plaster.
@@ -47,7 +55,7 @@ const LACQUER = new THREE.MeshStandardMaterial({
  * raw-vs-finished gap.
  */
 const BONE = new THREE.MeshPhysicalMaterial({
-  color: '#a08c55',
+  color: ACTIVE_THEME.pieceWhiteColor,
   roughness: 0.58,
   metalness: 0,
   clearcoat: 0.8,
@@ -123,15 +131,16 @@ function applyMaterial(object3d, isWhite, fade) {
 }
 
 export default function PieceModel({ type, color, fade = false, ...groupProps }) {
-  const config = PIECE_CONFIG[type];
-  const { scene } = useGLTF(config.model);
+  const targetHeight = PIECE_HEIGHTS[type];
+  const modelPath = pieceModelPath(ACTIVE_THEME_KEY, type);
+  const { scene } = useGLTF(modelPath);
 
   const instance = useMemo(() => {
     const clone = scene.clone(true);
-    normalizeHeight(clone, config.targetHeight);
+    normalizeHeight(clone, targetHeight);
     applyMaterial(clone, color === 'w', fade);
     return clone;
-  }, [scene, config, color, fade]);
+  }, [scene, targetHeight, color, fade]);
 
   // The instance's own transform (scale + base-at-y=0 offset from
   // normalizeHeight) must stay untouched by the outer board-position — so
@@ -143,4 +152,4 @@ export default function PieceModel({ type, color, fade = false, ...groupProps })
   );
 }
 
-Object.values(PIECE_CONFIG).forEach((config) => useGLTF.preload(config.model));
+Object.keys(PIECE_HEIGHTS).forEach((type) => useGLTF.preload(pieceModelPath(ACTIVE_THEME_KEY, type)));

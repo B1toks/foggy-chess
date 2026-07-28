@@ -1,15 +1,20 @@
 import { useEffect, useMemo, useState } from 'react';
 import { squareToWorld } from '../lib/coords';
 import { ALL_SQUARES, HIGHLIGHT_HEIGHT } from '../lib/fog';
+import { THEMES, themeKeyFromUrl } from '../lib/themes';
 import { getBoardRoughnessMap } from './proceduralTextures';
 import { sfx } from './audio';
+
+// Крок 13: read once at module load, same convention PieceModel.jsx and
+// RockIsland.jsx use.
+const ACTIVE_THEME = THEMES[themeKeyFromUrl()];
 
 // The light/dark split has to be obvious at a glance — a chessboard should
 // read as a chessboard instantly. The previous pair (#EDE7D9 / #D6CDBA) was
 // nearly the same value and left the board looking unfinished.
-const LIGHT = '#E0D6C0';
-const DARK = '#8B7F6A';
-const HIGHLIGHT = '#C1440E';
+const LIGHT = ACTIVE_THEME.board.light;
+const DARK = ACTIVE_THEME.board.dark;
+const HIGHLIGHT = ACTIVE_THEME.accent;
 const GRID = '#2B2018';
 // Near-black frame: the darkest mass in the composition, and what anchors the
 // whole light-key scene.

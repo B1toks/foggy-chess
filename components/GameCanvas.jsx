@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { Canvas, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { ContactShadows, OrbitControls } from '@react-three/drei';
-import CameraRig from './CameraRig';
-import IntroCameraRig, { INTRO_START_POSITION } from './IntroCameraRig';
+import CameraRig, { basePositionFor } from './CameraRig';
+import IntroCameraRig, { INTRO_START_POSITION, TRANSITION_DURATION } from './IntroCameraRig';
 import { GAME_OVER_STATUSES, useChessGame } from '../lib/useChessGame';
 import { computeVisibility } from '../lib/visibility';
 import { ALL_SQUARES, squaresBetween } from '../lib/fog';
+import { easeInOutCubic } from '../lib/easing';
 import Board from './Board';
 import Pieces, { MOVE_DURATION } from './Pieces';
 import Fog from './Fog';
@@ -17,6 +18,7 @@ import { playMoveSound } from './audio';
 import HUD from './HUD';
 import IntroOverlay from './IntroOverlay';
 import PromotionModal from './PromotionModal';
+import GameOverScreen from './GameOverScreen';
 
 // Only ever seen for the one frame before the canvas paints (or if WebGL is
 // unavailable) — SkyDome now covers the camera at every angle once mounted.
@@ -123,6 +125,48 @@ const MAX_POLAR_ANGLE = 1.25;
 const ALL_VISIBLE = new Set(ALL_SQUARES);
 
 const INTRO_SEEN_KEY = 'dead-reckoning:intro-seen';
+
+/*
+ * Крок 14, Section A: "Play Again" gets the same ceremonial camera-return +
+ * fog-reveal hand-off the initial intro does, without replaying the whole
+ * 14-second cinematic loop. Rather than reusing IntroCameraRig (which
+ * initializes its own `currentTarget`/`transition` refs assuming it is
+ * mounting fresh into the 'intro' shot, not resuming from wherever the
+ * player's own OrbitControls left the camera), this is a small, standalone
+ * one-shot: it captures the camera's CURRENT position on its first frame
+ * (whatever OrbitControls left it at) and eases it back to the same resting
+ * position CameraRig itself would place it at, over the same
+ * TRANSITION_DURATION the intro's own hand-off uses. `onComplete` fires once,
+ * guarded by `doneRef` — without that guard it would fire on every frame
+ * after p reaches 1, since this component doesn't unmount itself; GameCanvas
+ * unmounts it by flipping `phase` back to 'playing' in response.
+ */
+function ReplayCameraRig({ onComplete }) {
+  const camera = useThree((s) => s.camera);
+  const size = useThree((s) => s.size);
+  const start = useRef(null);
+  const elapsed = useRef(0);
+  const doneRef = useRef(false);
+  const targetVec = useRef(new THREE.Vector3());
+
+  useFrame((_, delta) => {
+    if (start.current === null) start.current = camera.position.clone();
+    elapsed.current += delta;
+    const p = Math.min(1, elapsed.current / TRANSITION_DURATION);
+    const eased = easeInOutCubic(p);
+    const aspect = size.width / size.height;
+    const [ex, ey, ez] = basePositionFor(aspect);
+    targetVec.current.set(ex, ey, ez);
+    camera.position.lerpVectors(start.current, targetVec.current, eased);
+    camera.lookAt(0, 0, 0);
+    if (p >= 1 && !doneRef.current) {
+      doneRef.current = true;
+      onComplete();
+    }
+  });
+
+  return null;
+}
 
 /**
  * QA hook, gated behind ?debug=1 like the HUD's own vision counter: exposes
@@ -250,9 +294,11 @@ export default function GameCanvas() {
     return () => clearTimeout(timer);
   }, [history]);
 
-  // 'intro' -> 'transitioning' -> 'playing'. IntroCameraRig owns the camera
-  // for the first two; real OrbitControls + CameraRig only mount for the
-  // third — see the Canvas children below.
+  // 'intro' -> 'transitioning' -> 'playing' -> (Play Again) 'replaying' ->
+  // 'playing'. IntroCameraRig owns the camera for 'intro'/'transitioning';
+  // ReplayCameraRig owns it for 'replaying' (Крок 14, Section A — see its own
+  // comment above); real OrbitControls + CameraRig only mount for 'playing'
+  // — see the Canvas children below.
   const [phase, setPhase] = useState(initialPhase);
   // Mutated imperatively from inside the Canvas (IntroCameraRig's useFrame),
   // never through React state — see FogLayer/CameraRig for the same pattern
@@ -266,6 +312,49 @@ export default function GameCanvas() {
       // Non-fatal: the intro will simply play again next reload.
     }
     setPhase('transitioning');
+  }
+
+  /*
+   * Крок 14, Section A: "Play Again" resets the game state immediately, then
+   * hands the camera to ReplayCameraRig for the return trip. Resetting up
+   * front (rather than waiting for the camera to arrive) is deliberate:
+   * 'replaying' drops `showFog` to false below, exactly like 'intro'/
+   * 'transitioning' already do, so the board reads fully clear (no fog, no
+   * stale "game already over" position) for the whole ~1.2s flight — the
+   * player never sees a fogged, finished board mid-transition. Once the
+   * camera lands, ReplayCameraRig's onComplete flips phase back to 'playing',
+   * which remounts <Fog> fresh — an empty `prevVisible` on that fresh mount is
+   * exactly what FogShader's `isInitialReveal` already keys off of (see
+   * lib/fog.js and FogShader.jsx), so the ceremonial reveal fires for a
+   * replay the same way it fires for a first game start, with no separate
+   * signalling needed between the two.
+   */
+  function handlePlayAgain() {
+    reset();
+    setPendingPromotion(null);
+    setSelectedSquare(null);
+    setHoveredSquare(null);
+    setPhase('replaying');
+  }
+
+  // "Change Theme" goes all the way back to the title screen, where
+  // IntroOverlay's own theme picker lives (see that file) — themes are read
+  // once at module load across lib/fog.js, PieceModel.jsx, RockIsland.jsx
+  // etc. (see lib/themes.js), so actually switching one is a page reload, not
+  // a React state change; this just gets the player back to the screen that
+  // offers it. Clearing the session flag means a manual reload also lands on
+  // the intro rather than skipping straight back to 'playing'.
+  function handleChangeTheme() {
+    try {
+      window.sessionStorage.removeItem(INTRO_SEEN_KEY);
+    } catch {
+      // Non-fatal: only affects a future reload's starting phase.
+    }
+    reset();
+    setPendingPromotion(null);
+    setSelectedSquare(null);
+    setHoveredSquare(null);
+    setPhase('intro');
   }
 
   const gameVisibility = computeVisibility(game, PLAYER_COLOR);
@@ -400,6 +489,10 @@ export default function GameCanvas() {
             />
             <OrbitControls
               ref={controlsRef}
+              // Крок 14, Section B: frozen the instant the game actually ends
+              // — "the board freezes right after mate" — rather than staying
+              // orbitable underneath the new GameOverScreen.
+              enabled={!GAME_OVER_STATUSES.includes(status)}
               enablePan={false}
               enableDamping
               dampingFactor={0.08}
@@ -411,6 +504,12 @@ export default function GameCanvas() {
               maxPolarAngle={MAX_POLAR_ANGLE}
             />
           </>
+        ) : phase === 'replaying' ? (
+          // Крок 14, Section A: "Play Again"'s camera-return leg. Real
+          // OrbitControls isn't mounted here (same reasoning as the intro
+          // phases below it doesn't get one either) so nothing fights this
+          // component's direct camera writes.
+          <ReplayCameraRig onComplete={() => setPhase('playing')} />
         ) : (
           // Not OrbitControls with enabled={false}: the three cinematic shots
           // are scripted cuts (frame 2 orbits *around a piece*, not the board
@@ -459,9 +558,24 @@ export default function GameCanvas() {
         visibleCount={visibility.size}
         onNewGame={reset}
         showGameplay={phase === 'playing'}
+        fen={game.fen()}
       />
 
       {phase === 'intro' && <IntroOverlay onStart={handleStart} />}
+
+      {/* Крок 14, Section B: gated on `phase === 'playing'` specifically, not
+          just the status — the instant "Play Again" flips phase to
+          'replaying' this unmounts immediately, which is what lets the
+          screen disappear right as the camera starts its return instead of
+          hanging around over top of it. */}
+      {phase === 'playing' && GAME_OVER_STATUSES.includes(status) && (
+        <GameOverScreen
+          status={status}
+          turn={turn}
+          onPlayAgain={handlePlayAgain}
+          onChangeTheme={handleChangeTheme}
+        />
+      )}
 
       {/* HTML modal, not a floating 3D panel (Крок 13) — see
           components/PromotionModal.jsx. onPick/onCancel are Board's own

@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { THEMES, themeKeyFromUrl } from '../lib/themes';
 
 /*
  * Крок 8, Section B: replaces the old TitleScreen. That version carried its
@@ -55,6 +56,60 @@ function TextScrim({ children, inset = '-28px -56px' }) {
 // width without hardcoding a second breakpoint ladder.
 const TITLE_SIZE = 'clamp(1.9rem, 7vw, 3.6rem)';
 
+/*
+ * Крок 14, Section B: "Change Theme" (GameOverScreen.jsx) sends the player
+ * back here, to the one screen that offers a theme choice. Themes are read
+ * once at module load across lib/fog.js, PieceModel.jsx, RockIsland.jsx etc.
+ * (see lib/themes.js's own header comment), so picking one is a real page
+ * navigation with `?theme=` set, not a React state change — nothing here
+ * tries to hot-swap live.
+ */
+function setThemeAndReload(key) {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('theme', key);
+    window.location.href = url.toString();
+  } catch {
+    // Non-fatal — worst case the picker just doesn't navigate.
+  }
+}
+
+function ThemePicker() {
+  const active = themeKeyFromUrl();
+
+  return (
+    <div
+      style={{
+        marginTop: 14,
+        display: 'flex',
+        gap: 10,
+        justifyContent: 'center',
+        flexWrap: 'wrap',
+        pointerEvents: 'auto',
+      }}
+    >
+      {Object.entries(THEMES).map(([key, theme]) => (
+        <button
+          key={key}
+          onClick={() => setThemeAndReload(key)}
+          className={`intro-theme-button${key === active ? ' active' : ''}`}
+          style={{
+            fontFamily: 'var(--font-ui), system-ui, sans-serif',
+            fontSize: 11,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            padding: '6px 14px',
+            borderRadius: 4,
+            cursor: 'pointer',
+          }}
+        >
+          {theme.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function IntroOverlay({ onStart }) {
   useEffect(() => {
     const onKey = (e) => {
@@ -91,6 +146,21 @@ export default function IntroOverlay({ onStart }) {
         .intro-begin-button:hover {
           background: #C1440E;
           color: #F4F1EA;
+        }
+        .intro-theme-button {
+          background: transparent;
+          color: rgba(244,241,234,0.75);
+          border: 1px solid rgba(244,241,234,0.35);
+          transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+        }
+        .intro-theme-button:hover {
+          border-color: #C1440E;
+          color: #F4F1EA;
+        }
+        .intro-theme-button.active {
+          background: #C1440E;
+          color: #F4F1EA;
+          border-color: #C1440E;
         }
       `}</style>
 
@@ -190,6 +260,7 @@ export default function IntroOverlay({ onStart }) {
         >
           You play White
         </div>
+        <ThemePicker />
       </TextScrim>
     </div>
   );

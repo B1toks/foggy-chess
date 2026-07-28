@@ -95,7 +95,9 @@ const CROSSFADE_BOUNDARIES = (() => {
 })();
 const CROSSFADE_HALF_WIDTH = 0.3; // 0.6s total dip, centred on the cut.
 
-const TRANSITION_DURATION = 1.2;
+// Exported so GameCanvas's ReplayCameraRig ("Play Again") can reuse the exact
+// same camera-return duration instead of a second hardcoded copy of it.
+export const TRANSITION_DURATION = 1.2;
 
 function crossfadeAlpha(t) {
   let nearest = Infinity;

@@ -13,7 +13,11 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 
 const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
-const url = `${BASE}/?debug=1`;
+// Крок 13: THEME env var so this can be re-run per theme after lib/themes.js
+// recolors the fog uniforms (fogPaletteFor) — defaults to mist so existing
+// invocations are unchanged.
+const THEME = process.env.THEME;
+const url = `${BASE}/?debug=1${THEME ? `&theme=${THEME}` : ''}`;
 
 const browser = await chromium.launch({ args: ['--use-gl=angle', '--enable-unsafe-swiftshader'] });
 const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });

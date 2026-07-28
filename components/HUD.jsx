@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { isAudioEnabled, setAudioEnabled } from './audio';
 import { GAME_OVER_STATUSES } from '../lib/useChessGame';
+import { THEMES, themeKeyFromUrl } from '../lib/themes';
 
 // Flip to true (or append ?debug=1) to bring back the vision readout.
 const SHOW_DEBUG = false;
@@ -71,6 +72,181 @@ function NewGameButton({ onNewGame, prominent }) {
     >
       ⟲
     </button>
+  );
+}
+
+/*
+ * Крок 16, Section D: theme switching mid-game, not just from the title or
+ * game-over screens (Крок 14/15's ThemePicker in IntroOverlay.jsx /
+ * GameOverScreen.jsx's "Change Theme" — both unchanged, both still reset to
+ * a brand new game on purpose, since that's the point of "change theme" from
+ * either of those screens). This is a THIRD, additive entry point: pick a
+ * theme without losing the game in progress.
+ *
+ * WHY THIS IS STILL A FULL RELOAD, and why that's not a compromise on "the
+ * game state is preserved": every themed module in this codebase
+ * (lib/fog.js, lib/themes.js's own consumers — PieceModel.jsx,
+ * RockIsland.jsx, Board.jsx, Backdrop.jsx) reads `themeKeyFromUrl()` ONCE at
+ * module load and holds it in a module-level constant, by design (see
+ * lib/themes.js's own header comment and CLAUDE.md's Крок 13 notes) — a
+ * pushState-only URL change would not cause any of them to re-evaluate.
+ * Converting every one of those into a reactive (context/prop-driven) read
+ * is a real architectural change, not this task.
+ *
+ * So this navigates, same as the existing "Change Theme" flows — but carries
+ * the CURRENT position across as `?fen=`, which useChessGame already
+ * supports as an initial-state hook (see its own `initialFen` param). The
+ * reload lands on a fresh chess.js instance at the same position, same turn,
+ * same castling/en-passant rights — everything a player can actually see or
+ * that affects legal moves going forward. The one thing that does NOT
+ * survive is chess.js's own move-history array, which nothing downstream
+ * depends on for correctness: it only ever feeds the move/capture SOUND
+ * trigger (compares history.length against its own last-seen value, which
+ * also resets to 0 on the fresh mount, so no false triggers) and the fog
+ * wave's origin square (lastMove null after a reload just means "no wave
+ * origin, settle in place" — already a handled, ordinary case, not an
+ * error). `INTRO_SEEN_KEY` is untouched by this reload, so it lands straight
+ * on 'playing', not the intro cinematic.
+ */
+const THEME_SWITCH_COOLDOWN_KEY = 'dead-reckoning:theme-switch-at';
+const THEME_SWITCH_COOLDOWN_MS = 10000;
+
+function remainingThemeSwitchCooldownMs() {
+  try {
+    const at = Number(window.sessionStorage.getItem(THEME_SWITCH_COOLDOWN_KEY));
+    if (!at) return 0;
+    return Math.max(0, THEME_SWITCH_COOLDOWN_MS - (Date.now() - at));
+  } catch {
+    return 0;
+  }
+}
+
+function switchThemeMidGame(key, fen) {
+  try {
+    window.sessionStorage.setItem(THEME_SWITCH_COOLDOWN_KEY, String(Date.now()));
+    const url = new URL(window.location.href);
+    url.searchParams.set('theme', key);
+    url.searchParams.set('fen', fen);
+    window.location.href = url.toString();
+  } catch {
+    // Non-fatal — worst case the button just doesn't navigate, and the
+    // cooldown timestamp (if it did get written) self-expires in 10s.
+  }
+}
+
+function ThemeSwitcherButton({ fen }) {
+  const [open, setOpen] = useState(false);
+  // Lazy init from sessionStorage so a page reloaded mid-cooldown (exactly
+  // what switching theme itself does) keeps counting down instead of
+  // resetting the button to immediately-usable — the whole point of a
+  // cooldown that survives the very action it's gating.
+  const [remaining, setRemaining] = useState(remainingThemeSwitchCooldownMs);
+
+  // Ticks every 100ms off the stored timestamp rather than a local counter,
+  // so it stays correct even if the tab was backgrounded (setInterval drift)
+  // — re-reading sessionStorage each tick is cheap and self-correcting.
+  useEffect(() => {
+    const id = setInterval(() => setRemaining(remainingThemeSwitchCooldownMs()), 100);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onClickAway = () => setOpen(false);
+    // Deferred a tick so the click that OPENED the panel doesn't also close
+    // it via this same listener.
+    const id = setTimeout(() => window.addEventListener('click', onClickAway), 0);
+    return () => {
+      clearTimeout(id);
+      window.removeEventListener('click', onClickAway);
+    };
+  }, [open]);
+
+  const onCooldown = remaining > 0;
+  const activeTheme = themeKeyFromUrl();
+  const secondsLeft = Math.ceil(remaining / 1000);
+
+  return (
+    <div style={{ position: 'relative' }} onClick={(e) => e.stopPropagation()}>
+      <style>{`
+        .hud-theme-button { background: transparent; color: var(--muted); border: 1px solid rgba(0,0,0,0.15); transition: background-color 0.2s ease, color 0.2s ease; }
+        .hud-theme-button:hover { border-color: var(--ember); color: var(--ember); }
+        .hud-theme-button.active { background: var(--ember); color: #F4F1EA; border-color: var(--ember); }
+      `}</style>
+      <button
+        onClick={() => !onCooldown && setOpen((o) => !o)}
+        disabled={onCooldown}
+        aria-pressed={open}
+        title={onCooldown ? `Change theme (${secondsLeft}s)` : 'Change theme'}
+        style={{
+          ...CORNER_BUTTON_STYLE,
+          color: onCooldown ? 'var(--muted)' : 'var(--lacquer)',
+          opacity: onCooldown ? 0.55 : 1,
+          cursor: onCooldown ? 'default' : 'pointer',
+          position: 'relative',
+          overflow: 'hidden',
+        }}
+      >
+        {onCooldown ? (
+          <span style={{ fontSize: 12, fontVariantNumeric: 'tabular-nums' }}>{secondsLeft}</span>
+        ) : (
+          '🎨'
+        )}
+        {/* The countdown ring — depletes clockwise as `remaining` counts down,
+            gone the instant the button becomes usable again. */}
+        {onCooldown && (
+          <span
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              borderRadius: 8,
+              background: `conic-gradient(rgba(193,68,14,0.45) ${(1 - remaining / THEME_SWITCH_COOLDOWN_MS) * 360}deg, transparent 0deg)`,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+      </button>
+
+      {open && !onCooldown && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 48,
+            right: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            padding: 8,
+            borderRadius: 8,
+            background: 'rgba(237, 231, 217, 0.96)',
+            border: '1px solid #D6CDBA',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            minWidth: 132,
+          }}
+        >
+          {Object.entries(THEMES).map(([key, theme]) => (
+            <button
+              key={key}
+              onClick={() => (key === activeTheme ? setOpen(false) : switchThemeMidGame(key, fen))}
+              className={`hud-theme-button${key === activeTheme ? ' active' : ''}`}
+              style={{
+                fontFamily: 'var(--font-ui), system-ui, sans-serif',
+                fontSize: 11,
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                padding: '6px 10px',
+                borderRadius: 4,
+                cursor: 'pointer',
+                textAlign: 'left',
+              }}
+            >
+              {theme.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -147,41 +323,7 @@ function FpsCounter() {
   return <>{fps} fps</>;
 }
 
-/*
- * The large checkmate flash — same ember as the board's own move highlight.
- * There is deliberately no equivalent "Check" flash: the fog hides enemy
- * pieces the player hasn't seen move, and a check warning would announce
- * "something you can't see is attacking your king" regardless of whether the
- * attacker is actually visible. That's exactly the surprise fog of war is
- * supposed to allow — a player who never spots the attacker should be able
- * to walk straight into a checkmate with no on-screen tell beforehand.
- */
-function StatusFlash({ text }) {
-  return (
-    <div
-      key={text}
-      aria-live="polite"
-      style={{
-        position: 'absolute',
-        top: 28,
-        left: '50%',
-        transform: 'translateX(-50%)',
-        zIndex: 10,
-        fontFamily: 'var(--font-display), Georgia, serif',
-        fontWeight: 600,
-        fontSize: 'clamp(28px, 5vw, 48px)',
-        color: 'var(--ember)',
-        textShadow: '0 2px 24px rgba(237,231,217,0.7), 0 1px 3px rgba(20,18,15,0.25)',
-        pointerEvents: 'none',
-        animation: 'hud-status-flash 0.5s ease',
-      }}
-    >
-      {text}
-    </div>
-  );
-}
-
-export default function HUD({ turn, status, visibleCount, onNewGame, showGameplay = true }) {
+export default function HUD({ turn, status, visibleCount, onNewGame, showGameplay = true, fen }) {
   const showDebug =
     SHOW_DEBUG ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug'));
@@ -189,15 +331,13 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
   const turnLabel = turn === 'w' ? 'White (you)' : 'Black (AI)';
   const isOver = GAME_OVER_STATUSES.includes(status);
 
-  // Check is deliberately not surfaced anywhere in the HUD — see the
-  // StatusFlash comment below for why: telling the player their king is
-  // under attack is exactly the kind of information the fog is supposed to
-  // withhold when the attacker itself is unseen.
-  //
-  // Крок 14: a captured king is a real, immediate end to the game (see
-  // lib/kingCapture.js) — the same "the game has genuinely ended, nothing
-  // left to withhold" reasoning that already applies to checkmate, so it
-  // gets the same corner-message + StatusFlash treatment below.
+  // Check is deliberately not surfaced anywhere in the HUD: telling the
+  // player their king is under attack is exactly the kind of information the
+  // fog is supposed to withhold when the attacker itself is unseen. Every
+  // status that actually ends the game (checkmate, stalemate, draw, a
+  // captured king) still gets a corner message here, but the dedicated
+  // full-screen announcement now lives in GameOverScreen.jsx, not a HUD
+  // flash — see GameCanvas.jsx.
   let message;
   if (status === 'checkmate') {
     // chess.js leaves `turn` on the side that has been mated.
@@ -207,6 +347,8 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
     message = 'White’s king was captured — Black (AI) wins';
   } else if (status === 'blackKingCaptured') {
     message = 'Black’s king was captured — White (you) wins';
+  } else if (status === 'stalemate') {
+    message = 'Stalemate';
   } else if (status === 'draw') {
     message = 'Draw';
   } else {
@@ -215,13 +357,6 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
 
   return (
     <>
-      <style>{`
-        @keyframes hud-status-flash {
-          from { opacity: 0; transform: translate(-50%, -6px); }
-          to { opacity: 1; transform: translate(-50%, 0); }
-        }
-      `}</style>
-
       {/* One corner, one style, per the brief: sound is always here, "new
           game" joins it once gameplay starts (it has nothing to reset
           before then). Siblings rather than nested, since both are
@@ -239,6 +374,13 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
         >
           <SoundToggle />
           {showGameplay && <NewGameButton onNewGame={onNewGame} prominent={isOver} />}
+          {/* Крок 16, Section D: mid-game theme switching, gated the same way
+              "new game" already is (nothing to switch before gameplay
+              starts). Sits behind GameOverScreen's z-index once the game
+              actually ends — that screen has its own "Change Theme", which
+              resets to a new game on purpose, a different action from this
+              one. */}
+          {showGameplay && <ThemeSwitcherButton fen={fen} />}
         </div>
       )}
 
@@ -275,11 +417,6 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
               </div>
             )}
           </div>
-
-          {status === 'checkmate' && <StatusFlash text="Checkmate" />}
-          {(status === 'whiteKingCaptured' || status === 'blackKingCaptured') && (
-            <StatusFlash text="King Captured" />
-          )}
         </>
       )}
     </>

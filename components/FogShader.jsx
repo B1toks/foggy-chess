@@ -14,6 +14,9 @@ import {
   FOG_DEPTH_SHADE,
   FOG_EXTINCTION,
   FOG_HEIGHT,
+  FOG_INITIAL_REVEAL_DELAY,
+  FOG_INITIAL_REVEAL_DURATION,
+  FOG_INITIAL_SEED_FRACTION,
   FOG_LIGHT_STEP,
   FOG_LIGHT_UV,
   FOG_LIT_COLOR,
@@ -34,6 +37,7 @@ import {
   FOG_WAVE_DELAY_PER_CELL,
   FOG_WAVE_DURATION,
   squareChebyshevDistance,
+  squareChebyshevDistanceFromCenter,
   squareToMaskIndex,
 } from '../lib/fog';
 import { easeOutCubic } from '../lib/easing';
@@ -656,6 +660,12 @@ function useWaveState() {
     oldValue: new Float32Array(64),
     newValue: new Float32Array(64),
     startTime: new Float32Array(64),
+    // Крок 14: per-square wave duration, not a shared constant — the
+    // ceremonial initial reveal (see isInitialReveal below) runs longer than
+    // an ordinary move's wave, and each square's own in-flight wave has to
+    // keep whatever duration it was scheduled with even while a later square
+    // gets a different one.
+    duration: new Float32Array(64).fill(FOG_WAVE_DURATION),
     revealTime: new Float32Array(64).fill(-999),
     prevVisible: new Set(),
     clock: 0,
@@ -693,12 +703,57 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
     // (Крок 11) b = this square's current wave start time, for the
     // breathing-suppression gate. A channel is unused, kept at 0.
     const data = new Float32Array(64 * 4);
+    /*
+     * Крок 16, Section A: seeded from the real starting `visibility` (closed
+     * over here, since this useMemo runs exactly once at mount and captures
+     * whatever `visibility` the very first render passed in) instead of a
+     * blanket "everything hidden" fill — see FOG_INITIAL_SEED_FRACTION in
+     * lib/fog.js for why.
+     *
+     * Крок 17: seeding `wave.current.effective` alone was not enough. <Fog>
+     * doesn't mount at page load — it mounts the instant the intro-to-
+     * gameplay transition completes ('transitioning' -> 'playing'), INTO an
+     * r3f render loop that has already been ticking useFrame for several
+     * seconds (the intro camera rig). That means the very next useFrame call
+     * can land before this component's mount-time scheduling useEffect below
+     * has run — a passive effect is deferred past paint, but a render loop
+     * already in flight isn't waiting on it. When that race is lost,
+     * useFrame's per-square loop reads `oldValue`/`newValue`'s untouched
+     * Float32Array defaults (0/0) for every square, including ones just
+     * seeded to `effective = 1` right here, and overwrites them back to 0 —
+     * a currently-visible square (including one holding the player's own
+     * piece) flashes fully fogged, then has to play out a genuine 1.4s
+     * reveal-from-black once the scheduling effect finally runs and reads
+     * that already-corrupted 0 as its wave's `oldValue`. Verified against
+     * both `next dev` and a production `next build` (identical result, so
+     * this is not a dev-only Strict Mode artifact): a real Start-button
+     * click reproduces `oldValue: 0, newValue: 1` for a starting-visible
+     * square, where a plain page load (intro pre-skipped, nothing already
+     * animating) does not race the same way.
+     *
+     * The fix is to make this useMemo fully self-sufficient — it already
+     * runs synchronously during render, strictly before any paint or
+     * useFrame callback can fire, so seeding `oldValue`/`newValue`/
+     * `prevVisible` here too (not just `effective`) closes the race
+     * regardless of whether the render loop is idle or already spinning.
+     * With `prevVisible` pre-populated to match `visibility` exactly, the
+     * scheduling effect's own `wasVisible === isVisible` check skips every
+     * square on its first run — there is nothing left to reveal, because the
+     * seed already put every square exactly at its target.
+     */
     for (let i = 0; i < 64; i++) {
-      data[i * 4] = 0; // start fully fogged
-      data[i * 4 + 1] = -999; // revealTime
-      data[i * 4 + 2] = 0; // lastChangeStart
-      data[i * 4 + 3] = 0;
+      const square = ALL_SQUARES[i];
+      const idx = squareToMaskIndex(square);
+      const seedR = visibility.has(square) ? 1 : 1 - FOG_INITIAL_SEED_FRACTION;
+      data[idx * 4] = seedR;
+      data[idx * 4 + 1] = -999; // revealTime
+      data[idx * 4 + 2] = 0; // lastChangeStart
+      data[idx * 4 + 3] = 0;
+      wave.current.effective[idx] = seedR;
+      wave.current.oldValue[idx] = seedR;
+      wave.current.newValue[idx] = seedR;
     }
+    wave.current.prevVisible = new Set(visibility);
     const texture = new THREE.DataTexture(data, 8, 8, THREE.RGBAFormat, THREE.FloatType);
     texture.minFilter = THREE.LinearFilter;
     texture.magFilter = THREE.LinearFilter;
@@ -767,9 +822,24 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
     }
     if (!changed) return;
 
+    /*
+     * Крок 14: an empty `prev` means every square in `visibility` is becoming
+     * visible with nothing to compare against — true on a fresh mount, which
+     * covers both the real game start (Fog isn't mounted at all during the
+     * intro, see GameCanvas's `showFog`) and a "Play Again" replay (GameCanvas
+     * drops phase out of 'playing' during the camera's return, unmounting Fog,
+     * then remounts it once the camera arrives — see ReplayCameraRig). Neither
+     * has a real lastMove to originate a wave from, and both deserve the
+     * ceremonial treatment: slower, and spreading from the board's own centre
+     * rather than a square that doesn't exist yet.
+     */
+    const isInitialReveal = prev.size === 0;
+
     const now = w.clock;
     const revealOrigin = lastMove?.to ?? null;
     const concealOrigin = lastMove?.from ?? revealOrigin;
+    const startDelay = isInitialReveal ? FOG_INITIAL_REVEAL_DELAY : 0;
+    const duration = isInitialReveal ? FOG_INITIAL_REVEAL_DURATION : FOG_WAVE_DURATION;
 
     for (let i = 0; i < 64; i++) {
       const square = ALL_SQUARES[i];
@@ -778,8 +848,13 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
       const isVisible = visibility.has(square);
       if (wasVisible === isVisible) continue;
 
-      const origin = isVisible ? revealOrigin : concealOrigin;
-      let delay = origin ? squareChebyshevDistance(square, origin) * FOG_WAVE_DELAY_PER_CELL : 0;
+      let delay = startDelay;
+      if (isInitialReveal) {
+        delay += squareChebyshevDistanceFromCenter(square) * FOG_WAVE_DELAY_PER_CELL;
+      } else {
+        const origin = isVisible ? revealOrigin : concealOrigin;
+        if (origin) delay += squareChebyshevDistance(square, origin) * FOG_WAVE_DELAY_PER_CELL;
+      }
       if (isVisible && enemyPieceSquares?.has(square)) delay += FOG_REVEAL_THICKEN_DURATION;
 
       // Continue from wherever the square currently, visually is — not from
@@ -787,6 +862,7 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
       // second quick move restarts smoothly instead of popping.
       w.oldValue[idx] = w.effective[idx];
       w.newValue[idx] = isVisible ? 1 : 0;
+      w.duration[idx] = duration;
       w.startTime[idx] = now + delay;
       if (isVisible) w.revealTime[idx] = now + delay;
     }
@@ -801,10 +877,15 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
 
     const data = mask.image.data;
     for (let i = 0; i < 64; i++) {
-      const t =
-        FOG_WAVE_DURATION > 0
-          ? Math.min(1, Math.max(0, (now - w.startTime[i]) / FOG_WAVE_DURATION))
-          : 1;
+      // Крок 14: driven by `now`, an accumulation of real useFrame `delta`
+      // (seconds), never a frame count — so a slow device just sees fewer,
+      // bigger steps toward the same real-time target instead of the wave
+      // stalling. And since t is clamped to 1 here, a square can never sit
+      // short of its target for longer than its own `duration` regardless of
+      // frame rate: there's no unclamped accumulator that could overshoot or
+      // hang past that.
+      const dur = w.duration[i];
+      const t = dur > 0 ? Math.min(1, Math.max(0, (now - w.startTime[i]) / dur)) : 1;
       const eased = easeOutCubic(t);
       const value = w.oldValue[i] + (w.newValue[i] - w.oldValue[i]) * eased;
       w.effective[i] = value;

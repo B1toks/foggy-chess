@@ -58,9 +58,20 @@ import { simplify, weld, prune, dedup } from '@gltf-transform/functions';
 import { MeshoptSimplifier } from 'meshoptimizer';
 import draco3d from 'draco3dgltf';
 
-const MODEL_DIR = 'public/models';
-// Gitignored and outside public/ — see the backup comment further down.
-const BACKUP_DIR = 'assets-src/models-original';
+/*
+ * Крок 13: ocean and snow ship their own piece + rock sets, laid out the same
+ * way as mist (public/models/<theme>/{king,queen,rook,bishop,knight,pawn,
+ * rock-island}.glb — see lib/themes.js). This tool now iterates all three
+ * theme directories instead of one, mirroring the same structure into the
+ * backup dir (assets-src/models-original/<theme>/...) so the per-theme
+ * "rock-island.glb"/"king.glb" basenames — identical across themes — don't
+ * collide in a single flat backup folder.
+ */
+const THEME_DIRS = ['mist', 'ocean', 'snow'].map((theme) => ({
+  theme,
+  modelDir: `public/models/${theme}`,
+  backupDir: `assets-src/models-original/${theme}`,
+}));
 
 /*
  * THE FLAG THAT ACTUALLY MAKES THIS WORK
@@ -110,7 +121,10 @@ const SIMPLIFIER_FLAGS = ['Permissive', 'Prune'];
  * the stall above.
  */
 const PROFILES = {
-  'granite-pine-aerie-optimized.glb': {
+  // Крок 13: renamed from the mist-specific 'granite-pine-aerie-optimized.glb'
+  // to the shared per-theme basename now that ocean/snow ship their own rock
+  // under the same name (public/models/<theme>/rock-island.glb).
+  'rock-island.glb': {
     ratio: 0.06,
     error: 0.05,
     keepTextures: true,
@@ -164,23 +178,24 @@ function countTris(doc) {
 }
 
 /*
- * Refuse to run twice: the tool is not idempotent in a useful way (a second
- * pass would decimate the already-decimated file by another 1.6%), and the
- * backup guard below means the true original would still be safe but the
- * shipped file would be destroyed. Presence of a backup means this already ran.
+ * Refuse to run twice PER THEME: a theme whose files already have a backup
+ * has already been decimated (a second pass would decimate the already-
+ * decimated file by another 1.6%), but a theme that has never been touched
+ * (e.g. ocean/snow the first time this runs after Крок 13) must still
+ * proceed — so the guard is evaluated independently per theme directory,
+ * not once globally, and themes that are already done are simply skipped
+ * rather than aborting the whole run.
  */
-const files = fs.readdirSync(MODEL_DIR).filter((f) => f.endsWith('.glb'));
-if (WRITE) {
-  const already = files.filter((f) => fs.existsSync(path.join(BACKUP_DIR, f)));
+const jobs = [];
+for (const { theme, modelDir, backupDir } of THEME_DIRS) {
+  if (!fs.existsSync(modelDir)) continue;
+  const files = fs.readdirSync(modelDir).filter((f) => f.endsWith('.glb'));
+  const already = files.filter((f) => fs.existsSync(path.join(backupDir, f)));
   if (already.length) {
-    console.error(
-      `Refusing to run: ${already.length} model(s) already have a backup in ${BACKUP_DIR},\n` +
-        `which means this tool has already been applied. Restore from there first if you\n` +
-        `want to re-decimate with different settings:\n` +
-        already.map((f) => `  copy ${path.join(BACKUP_DIR, f)} ${path.join(MODEL_DIR, f)}`).join('\n'),
-    );
-    process.exit(1);
+    console.log(`[${theme}] already decimated (backup present) — skipping ${already.length} file(s)`);
+    continue;
   }
+  for (const file of files) jobs.push({ theme, modelDir, backupDir, file });
 }
 
 let beforeTotal = 0;
@@ -188,13 +203,14 @@ let afterTotal = 0;
 let beforeBytes = 0;
 let afterBytes = 0;
 
-console.log(WRITE ? 'DECIMATING (writing files)\n' : 'DRY RUN (pass --write to apply)\n');
+console.log(WRITE ? '\nDECIMATING (writing files)\n' : '\nDRY RUN (pass --write to apply)\n');
 console.log(
   'file'.padEnd(38) + 'tris in'.padStart(9) + 'tris out'.padStart(10) + 'KB in'.padStart(9) + 'KB out'.padStart(9),
 );
 
-for (const file of files) {
-  const full = path.join(MODEL_DIR, file);
+for (const { theme, modelDir, backupDir, file } of jobs) {
+  const full = path.join(modelDir, file);
+  const label = `${theme}/${file}`;
   const profile = PROFILES[file] ?? PROFILES.default;
   const doc = await io.read(full);
   const before = countTris(doc);
@@ -268,8 +284,8 @@ for (const file of files) {
      * tool twice and the second run would otherwise "back up" the already-
      * decimated file over the true original and destroy it.
      */
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const backup = path.join(BACKUP_DIR, file);
+    fs.mkdirSync(backupDir, { recursive: true });
+    const backup = path.join(backupDir, file);
     if (!fs.existsSync(backup)) fs.copyFileSync(full, backup);
     fs.writeFileSync(full, bytes);
   }
@@ -280,7 +296,7 @@ for (const file of files) {
   afterBytes += bytes.byteLength;
 
   console.log(
-    file.padEnd(38) +
+    label.padEnd(38) +
       String(before.tris).padStart(9) +
       String(after.tris).padStart(10) +
       String(Math.round(sizeBefore / 1024)).padStart(9) +

@@ -342,6 +342,72 @@ too — it's a global preference, not part of the game state, and the intro's
 own wind-bed ambience is worth being able to turn on before the board is even
 interactive.
 
+### Крок 16, Section D: theme switching mid-game
+
+Before this pass, a theme could only be picked from `IntroOverlay`'s
+`ThemePicker` (title screen) or reached again via `GameOverScreen`'s "Change
+Theme" (which routes back to the title screen and starts a brand new game).
+Both of those still exist and still reset to a new game on purpose — Section
+D adds a **third**, additive entry point: a small palette-icon button
+(`ThemeSwitcherButton`, `HUD.jsx`) in the same bottom-right corner cluster as
+sound/new-game, visible whenever `showGameplay` is true, that switches the
+visual theme **without** starting over.
+
+**Why this is still a full page navigation, and why that isn't a compromise
+on "the game state is preserved".** Every themed module in this codebase —
+`lib/fog.js`, and `lib/themes.js`'s own consumers (`PieceModel.jsx`,
+`RockIsland.jsx`, `Board.jsx`, `Backdrop.jsx`) — reads `themeKeyFromUrl()`
+exactly once, at module load, into a module-level constant (`lib/themes.js`'s
+own header comment already documents this as deliberate: "picking one is a
+real page navigation... not a React state change"). A `history.pushState`
+without a reload would leave every one of those modules holding the *old*
+theme's colors/models forever; making them reactive instead is a real
+architectural change (context or props threaded through every themed file)
+and not what this task is. So the button still navigates — but it now carries
+the **current position** across as `?fen=` (chess.js's own FEN string,
+`game.fen()`, threaded from `GameCanvas.jsx` into `<HUD fen={...}>`), reusing
+`useChessGame`'s existing `initialFen` QA hook (see "QA hooks") rather than
+adding a second mechanism. The reload lands on a fresh `Chess()` at the same
+position, same turn, same castling/en-passant rights — everything that's
+either visible on the board or affects legal moves going forward.
+
+**What does *not* survive is chess.js's own move-history array — and nothing
+downstream needs it to.** It only ever feeds two things: the move/capture
+sound trigger (`GameCanvas.jsx` compares `history.length` against its own
+last-seen ref, which also resets to 0 on the fresh mount, so no false
+triggers) and the fog wave's origin square (`lastMove` is `null` right after
+the reload, which the wave-scheduling code already treats as an ordinary,
+handled case — "no wave origin, just settle in place" — not an error; see
+"Fog" -> Крок 10 Section C). `INTRO_SEEN_KEY` in `sessionStorage` is untouched
+by this reload, so the player lands straight back on `phase: 'playing'`, not
+the intro cinematic — the switch reads as "the world changed," not as "the
+game restarted."
+
+**The fresh Fog mount this produces is exactly the case Крок 16 Section A
+was built for.** A theme switch's reload gives `FogShader` an empty
+`prevVisible` (a fresh mount), the same `isInitialReveal` path a first game
+start or "Play Again" takes — and Section A's seeded-mask fix means that
+reveal is no longer a flash of full fog before settling, it's already close
+to correct on the very first frame. These two sections compound for free,
+not by coincidence.
+
+**The cooldown survives the reload on purpose — it has to.** Storing "last
+switched at" only in React state would reset to zero on every remount,
+making a cooldown that's defeated by the very navigation it's supposed to
+gate pointless. `THEME_SWITCH_COOLDOWN_KEY` in `sessionStorage` holds a wall-
+clock timestamp; `remainingThemeSwitchCooldownMs()` re-derives the remaining
+time from `Date.now()` on a 100ms poll rather than counting down a local
+timer, so it stays correct across a backgrounded tab and, critically, across
+the reload the button itself triggers. The button shows a numeral
+(`Math.ceil(remaining/1000)`) in place of the 🎨 glyph and a `conic-gradient`
+ring that depletes clockwise over `THEME_SWITCH_COOLDOWN_MS` (10s), and is
+`disabled` for the same span — the panel can't even be opened mid-cooldown,
+not just "clicking a theme does nothing."
+
+Picking the theme that's already active is a no-op (closes the panel,
+doesn't navigate or spend the cooldown) — `ThemeSwitcherButton` checks the
+clicked key against `themeKeyFromUrl()` before calling `switchThemeMidGame`.
+
 ## Asset budget (Крок 12, Section A) — read this before profiling anything else
 
 **Every model Mint delivered was exactly 500,000 triangles.** That is a cap on
@@ -495,6 +561,177 @@ heights compare honestly without perspective. Its `<Measurer>` writes real
 world-space measurements to `window.__pieceMeasurements` — read that instead
 of eyeballing pixels when a proportion looks off.
 
+## Крок 13: theme system (Mist / Ocean Depths / Snow Blizzard)
+
+Two more Mint-generated piece sets shipped, alongside a snow-themed Gaussian
+splat. This pass turned the previously-hardcoded Mist look into three
+selectable themes rather than bolting a second set on next to it.
+
+**`lib/themes.js` is the registry.** One entry per theme (`mist`/`ocean`/
+`snow`), each carrying: `modelDir` (`/models/<theme>/`), `board.light`/
+`board.dark`, `accent` (the move/check highlight), `pieceWhiteColor` (the
+BONE-equivalent body tint), `rockTint`, `fog` (`shadow`/`lit`/`tint`/`color`),
+and `backdrop` (`{ mode: 'image' | 'splat', splatUrl? }`). `themeKeyFromUrl()`
+reads `?theme=` once — same read-once-at-module-load convention every other
+tuning hook in this codebase already uses (`PieceModel.jsx`'s
+`boneTuningFromUrl`, `Backdrop.jsx`'s `readTuning`) — and every themed module
+(`PieceModel.jsx`, `RockIsland.jsx`, `Board.jsx`, `lib/fog.js`,
+`Backdrop.jsx`) calls it independently at module scope rather than threading
+a prop through the tree. There is no live in-session theme switch; picking a
+theme is a page-load decision, same as every other `?`-prefixed tuning knob
+here. `?theme=` absent or unrecognized falls back to `mist`
+(`DEFAULT_THEME`).
+
+**Asset layout**: `public/models/<theme>/{king,queen,rook,bishop,knight,pawn,
+rock-island}.glb` — one directory per theme, identical basenames across all
+three. `lib/pieces.js` no longer owns model paths at all; it only keeps
+`PIECE_SCALE` and `PIECE_HEIGHTS` (renamed from `PIECE_CONFIG`, dropped the
+per-type `model` field), the proportion ladder derived against Mist's own
+models (see "3D models" above) and **deliberately reused as-is** for the new
+sets rather than re-derived — per Крок 13's own brief. Verified via
+`/dev-pieces?theme=ocean` / `?theme=snow`'s `window.__pieceMeasurements`: every
+piece's `halfWidth` stays well under the 0.5 clearance ceiling (worst case
+0.401 today, Mist's own knight), so the shared ladder does not reopen the
+knight-clearance problem "3D models" documents for a different geometry.
+
+**Both new sets arrived as raw ~500,000-triangle Mint exports** (matching
+"Asset budget"'s Крок 12 numbers exactly), not pre-decimated the way Mist's
+`public/models/mist/*.glb` already were — `tools/decimate-models.mjs` only
+ever knew about one flat `public/models/` directory. It's now theme-aware
+(`THEME_DIRS`, mirrored into `assets-src/models-original/<theme>/` so the
+identical basenames across themes don't collide in one backup folder) and the
+guard that refuses to double-decimate is now evaluated **per theme**, not
+globally, so re-running it after adding a fourth theme only touches the new
+one. `node tools/decimate-models.mjs --write` was run once for this pass:
+ocean and snow's 12 pieces went 500,000 → 8,000 triangles each (~4-6 MB →
+~30-40 KB) and their rocks went 500,000 → 30,000 (~5.5/6.5 MB → ~500 KB/2.4
+MB, the rock keeping Mint's baked textures same as Mist's — see "Крок 12,
+Sections B & D"). Skipping this would have reintroduced the exact
+geometry-bound problem "Asset budget" fixed, times two more sets.
+
+**Rock basin fit is per-theme, not shared.** `RockIsland.jsx`'s
+`ROCK_FIT_HALF_WIDTH`/`ROCK_FLOOR_Y_RAW` (now `ROCK_FIT`, keyed by theme) came
+from Mist's own `granite-pine-aerie` basin geometry and do not transfer to
+`basalt-kelp-ledge` (ocean) or `frosted-granite-ledge` (snow) — different
+models, different basin shape. Re-measured each with `tools/measure-rock.mjs
+public/models/<theme>/rock-island.glb` (same "rasterise triangles into a
+top-surface heightfield, not a Box3, not vertex binning" method as Mist's
+original derivation):
+
+| theme | half-width | floor Y | note |
+|---|---|---|---|
+| mist | 0.46 | 0.417 | original derivation |
+| ocean | 0.37 | 0.271 | much shallower relief than mist (raw rim only ~0.07 above floor) — reads as a flat kelp-covered ledge, not a deep bowl |
+| snow | 0.41 | 0.577 | closer to mist's own proportions (X/Z aspect 1.161 vs mist 1.164) |
+
+`ROCK_SCALE_Y` for ocean/snow reuses Mist's own Y/XZ **anisotropy ratio**
+(0.7785), not Mist's absolute `ROCK_SCALE_Y` — copying the raw number would
+not preserve the same "wide, shallow bowl" proportions on a differently-scaled
+basin. This is a **proportionate default, not a re-derivation**: unlike
+Mist's `ROCK_SCALE_Y` (independently checked against `MAX_POLAR_ANGLE`'s
+camera clearance — see "RockIsland" above), ocean/snow's Y scale has not been
+verified against that clearance the same way. Both landed with generous
+headroom by inspection (ocean's rim sits only ~0.65 world units above the
+board; snow's is proportionally similar), but flag this before relying on it
+if a rim ever reads wrong at a shallow camera angle in either theme.
+
+**Board/fog/accent colors came from the user, piece/rock tint did not.**
+Given palette:
+
+| theme | light square | dark square | accent | fog anchor |
+|---|---|---|---|---|
+| ocean | `#B8CCC8` | `#3C5A56` | `#4FD0C4` (pale cyan "bioluminescence", not cinnabar — reads better against a cold palette) | `#2A4A48` |
+| snow | `#E8EEF0` | `#7A8A94` | `#C1440E` (same ember as mist — warm against a cold world is a deliberate contrast, not a mismatch) | `#DDE6E8` |
+
+Piece white-body color reuses each theme's own light-square hex (confirmed
+with the user rather than inventing a third independent value); black pieces
+stay `#0E0E10` LACQUER everywhere, unthemed — legibility of "which color is
+which" was judged more important than per-theme tinting the AI's pieces.
+
+**Fog color derivation (`fogPaletteFor` in `lib/themes.js`) is a hue/
+saturation retint, not four hand-picked hex values.** The fog shader only has
+three *live* color uniforms left after Крок 12's rework — `FOG_SHADOW_COLOR`,
+`FOG_LIT_COLOR`, `FOG_TINT_COLOR` (`FOG_DEPTH_COLOR_LOW/HIGH/MID` are dead,
+superseded, unread by `FogShader.jsx` — confirmed by grepping the shader
+file, not assumed). Rather than pick three new hex values per theme and risk
+breaking the SHADOW-darker-than-LIT ordering or the luma budget
+`tools/fogdiag.mjs` verifies, `fogPaletteFor(anchorHex)` takes each of Mist's
+own three constants, keeps its **lightness** exactly as Mist tuned it, and
+replaces only hue/saturation with the anchor color's. `tools/fogdiag.mjs`'s
+occlusion/leak test is alpha-driven and measures luma, not hue, so this is
+safe by construction — re-verified after wiring:
+
+| theme | fogged mean / max luma leak | clear-square light/dark delta |
+|---|---|---|
+| mist (baseline, unchanged) | 2.17 / 4.49 | 36.69 |
+| ocean | 3.54 / 3.89 | 52.85 |
+| snow | 2.70 / 4.99 | 24.18 |
+
+All comfortably inside the ≤6-luma occlusion budget (`FOG_MAX_ALPHA` 0.94),
+and every theme's board still reads as an obvious chessboard. Rerun with
+`THEME=ocean node tools/fogdiag.mjs` (the script now takes a `THEME` env var,
+defaulting to mist so existing invocations are unchanged).
+
+**Rock tint** (`RockIsland.jsx`'s `applyRockMaterial` multiply color, `#B9B4A8`
+for Mist) is retinted the same way, anchored to each theme's own dark-square
+hex — not given by the user, a judgment call to keep the rock coherent with
+its board rather than universally warm-grey.
+
+**A pre-existing discrepancy, left alone on purpose**: `PieceModel.jsx`'s live
+BONE color is `#a08c55` (changed in the Крок 14 commit, apparently
+undocumented — Крок 14's own written notes don't mention a color change), not
+the `#DDD3BE` the "Palette" table above still documents. `lib/themes.js`'s
+`mist.pieceWhiteColor` mirrors the live `#a08c55` value deliberately (the
+registry describes what ships, not what the palette table says) — the
+discrepancy itself is a separate, not-yet-investigated question, flagged here
+so it isn't rediscovered as a surprise.
+
+### Крок 13: a second splat — snow, and this one shipped enabled
+
+`public/ink-wash-snow-plateau-f20dac755e66664b.spz` — Mint's delivered
+filename, **not** renamed to the brief's assumed `public/world/snow.spz`, kept
+at the `public/` root next to the existing mountain-valley splat
+(`sumi-e-mountain-valley-*.spz`) for the same reason that one lives there. At
+33,359,263 bytes (~31.8 MB) it lands in the brief's own "flag and wait, don't
+auto-integrate" band (25-60 MB) — flagged, and the user chose to integrate it
+anyway rather than defer.
+
+**Wiring reuses the exact `SplatBackdrop.jsx` pattern Mist's own (disabled)
+valley splat already established** (see "Gaussian splat backdrop" above) —
+`SplatBackdrop` just gained a `url` prop (default preserved for backward
+compatibility) instead of a hardcoded `SPLAT_URL` constant, so both splats
+share one component. `Backdrop.jsx`'s `BACKDROP_MODE` constant is now scoped
+to **Mist's own content only** (the painted valley segments + Mist's splat
+rollback) rather than a global switch; any theme other than mist always
+renders the procedural `Mountains` shells as its base regardless of that
+constant, and a theme's own splat (`THEMES[key].backdrop`) layers on top of
+that base — never replacing it, same "never throw upward" contract. Ocean's
+`backdrop.mode` is `'image'` (i.e., just the procedural floor, no splat this
+pass — the `ink-wash-sea-canyon-*.spz` file present in `public/` is out of
+scope for Крок 13 and untouched).
+
+**The brief's 4-second load budget is implemented as a mechanism, not
+verified against a real device.** `ThemedSplatBackdrop` (`Backdrop.jsx`)
+starts a timer on mount; if `window.__splat` hasn't reached `state: 'ready'`
+within `SPLAT_LOAD_BUDGET_MS` (4000), the component unmounts itself and the
+procedural floor already underneath is what stays on screen. This environment
+cannot produce a real measurement — see "Headless browser" below, the
+software rasterizer here runs at ~1fps regardless of payload and cannot
+distinguish a fast load from a slow one — so the number is unverified against
+"production, cold cache" the way the brief asked. `window.__splat` (already
+exposed by `SplatBackdrop.jsx`) confirmed a full local load reaching
+`{state: 'ready', count: 1920000}` in this environment, which at minimum
+proves the mechanism itself (fetch, decode, upload, `ready` promise) is wired
+correctly — not that it lands inside 4 real seconds on a cold cache.
+
+**No bespoke painted snow frame exists for the `'image'` fallback path.** The
+brief suggested extracting a preview frame from the same `.spz` as a `.jpg`;
+there is no frame-extraction tooling in this pass, so `THEMES.snow.backdrop.
+fallbackMode` is `'procedural'` — the generic `Mountains` ridge shells, not a
+snow-specific painting. Worth a real Mint-generated still frame later if the
+generic fallback (visible whenever the splat times out or errors) reads as a
+mismatch.
+
 ## Architecture
 
 ```
@@ -518,7 +755,8 @@ tools/                     — checked-in measurement/asset scripts; see "QA hoo
 components/HUD.jsx         — plain DOM overlay (turn/status, sound + new-game corner, control hint), absolutely positioned over the canvas
 lib/coords.js              — squareToWorld/worldToSquare, board centered at origin, a1 at the corner, 1 unit/cell
 lib/easing.js              — easeInOutCubic (intro camera + board move), easeOutCubic (fog wave + piece reveal, Крок 10 Section C)
-lib/pieces.js              — PIECE_CONFIG (model path + targetHeight) and CODE_TO_PIECE ('n' -> 'knight')
+lib/pieces.js              — PIECE_SCALE + PIECE_HEIGHTS (shared height ladder, theme-independent) and CODE_TO_PIECE ('n' -> 'knight')
+lib/themes.js              — THEMES registry (mist/ocean/snow: model paths, board/fog/accent colors, backdrop config); themeKeyFromUrl() (see "Крок 13: theme system")
 lib/useChessGame.js        — chess.js wrapper hook; isPromotion(); owns the AI-move effect (setTimeout keyed off turn/status)
 lib/visibility.js          — computeVisibility(game, color) -> Set<string>; unit-tested (lib/visibility.test.js)
 lib/ai.js                  — pickGreedyMove(game): highest-value capture, else random legal move
@@ -1140,6 +1378,64 @@ max (documented baseline 2.18 / 4.44 — unchanged within noise), clear-square
 light/dark delta 36.69 (baseline ~37.2) — the occlusion guarantee and tile
 readability both hold exactly as before, on top of the piece fix.
 
+### Крок 16, Section A: the mask must never exist in an "everything hidden" state
+
+**Not a shader change — the bug was in the mask's own starting values.**
+`FogShader.jsx`'s mask `DataTexture` used to be filled with a blanket `r = 0`
+(maximally fogged) for all 64 texels at mount, and the wave-scheduling effect
+(Крок 10 Section C's `isInitialReveal` branch, still used for a fresh mount
+or a "Play Again"/theme-switch remount) started every square's wave from
+whatever was already in `wave.current.effective` — which, for a brand new
+`Float32Array(64)`, also defaults to 0. So a currently-*visible* square's
+value climbed from 0 up to 1 over the whole `FOG_INITIAL_REVEAL_DURATION`
+(1.4s) + its own distance-from-centre delay, not just the newly-fogged ones —
+meaning the **entire board**, including squares that should already read
+clear, displayed as fully fogged for a real, human-visible span after every
+fresh mount (game start, "Play Again", and now Крок 16 Section D's mid-game
+theme switch too), not just for one throwaway frame.
+
+The fix seeds both the raw `DataTexture` content and `wave.current.effective`
+directly from the **real starting `visibility` Set**, computed synchronously
+before the first paint, instead of a blanket "hidden" fill —
+`FOG_INITIAL_SEED_FRACTION` (`lib/fog.js`, 0.8) is the knob: a square that's
+already visible seeds at exactly its target (`r = 1`, so its wave — if one
+even gets scheduled — is a mathematical no-op, 1→1) and a square that starts
+fogged seeds at `1 - FOG_INITIAL_SEED_FRACTION` (`r = 0.2`, i.e. density 0.8,
+not the full 1.0) rather than the opposite extreme. Both read as correct —
+clear vs. fogged — from the literal first rendered frame; only the fogged
+squares have anything left to visibly settle, and it's a small remaining step
+(density 0.8 → 1.0), not a full sweep from black. `FogShader.jsx`'s mask-
+building `useMemo` runs exactly once at mount and captures whatever
+`visibility` the very first render passed in via closure — the same lazy-
+init-capture pattern this codebase already uses elsewhere (`depthSizeRef` in
+the same file, `tuningRef`/`lowPowerRef` in `GameCanvas.jsx`).
+
+**A subtlety worth knowing, not a bug**: fogged squares are *skipped* by the
+`isInitialReveal` scheduling loop entirely (`wasVisible === isVisible ===
+false` → `continue`, unchanged from before this pass), so their `oldValue`/
+`newValue` stay at the `Float32Array` default (0/0) and the very next
+`useFrame` tick snaps their `effective` value straight to 0 — the seeded 0.2
+only survives for the literal first paint. This is fine and expected: at
+`FOG_ALPHA_KNEE` (0.38), density 0.8 and density 1.0 both already saturate
+`baseAlpha` to `FOG_MAX_ALPHA`, so the two are visually indistinguishable:
+the seed's only job was to avoid a shared, uniform "everything is fogged"
+read at frame one, not to hold a specific value past it.
+
+The per-move dispersal wave (Крок 10, Section C) is completely unchanged —
+this only touches a freshly-mounted mask's *starting* values, never how a
+wave animates once scheduled.
+
+Verified two ways: (1) `window.__fogWave`/`__fogMaterials` (`?debug=1`) read
+immediately after mount show `r = 1.00` for every one of the real starting
+24 visible squares and `r = 0.00` for the rest (already snapped past the
+one-paint seed by the time a script can read it, per the subtlety above —
+consistent, not a discrepancy); (2) a screenshot taken as early as the
+`window.__fogMaterials` hook exists (before any deliberate settle time) shows
+White's near half of the board already clean and only Black's far half
+fogged — never a uniform grey wash. `tools/fogdiag.mjs`'s occlusion numbers
+are unchanged (see the Крок 14 entry just above), confirming this doesn't
+touch the occlusion guarantee, only the starting point of what eases into it.
+
 ## Camera and environment
 
 The player is always White and rank 1 sits at z = -3.5, so the camera starts
@@ -1469,6 +1765,100 @@ took 109–114 seconds at both 1280x800 and 560x350. `window.__splat` carries
 thing to check first, along with whether a 32 MB critical-path download is
 acceptable at all.
 
+### Крок 16, Section B: the snow splat was upside down, `SplatBackdrop.jsx` is now theme-agnostic, and a real perf lever
+
+**The snow splat (`ink-wash-snow-plateau-*.spz`, shipped enabled per Крок
+13) rendered as a pale, frayed rectangle filling most of the frame — not a
+landscape.** Reusing Mist's own tuned `DEFAULTS` (`scale: 12, rotX: 180`)
+verbatim for a completely different capture was the immediate cause, and the
+specific symptom (a "carpet" that reads as neither ground nor sky) is the
+classic signature of an up-axis mismatch: SPZ captures are commonly
+photogrammetry/COLMAP-sourced and store **Z as up**, not three.js's Y-up.
+Swept live via the existing `?sprotX=` override (no code change needed to
+test) rather than guessed once: `rotX -90` (rotating the Z-up capture down
+onto Y-up) turns it into a recognisable snowy rock plateau, verified from
+both a far corner shot and a shallow, near-level one (the angle that most
+exposes a bad placement, per the Gaussian-splat section above). Scale and
+position are still Mist's own numbers, unverified beyond "doesn't look
+broken from two angles" — real placement tuning needs a real GPU and an eye
+per this file's own standing policy on splat placement, not this headless
+environment (a single frame still costs 100+ seconds here; see "Headless
+browser").
+
+**`SplatBackdrop.jsx` no longer hardcodes one capture's placement.** Its old
+module-level `DEFAULTS` is now `FALLBACK_DEFAULTS` (used only if a caller
+passes neither `defaults` nor a URL override), and every theme's own
+placement lives in `lib/themes.js`'s own `backdrop.splat` field
+(`{ scale, rotation: [x,y,z], position: [x,y,z] }`), next to that theme's
+`splatUrl` — `Backdrop.jsx` passes `THEMES[key].backdrop.splat` straight
+through as `<SplatBackdrop defaults={...}>`. This is what makes Section B's
+"prepare Ocean's splat, don't enable it" ask a one-line change later:
+`ink-wash-sea-canyon-*.spz` (already sitting in `public/`, untouched since
+Крок 13) has a `splatUrl` and a starting `splat` transform (snow's own
+corrected rotation, as a reasonable starting guess — **not independently
+verified**, same "flag before relying on it" caveat this file already
+carries for ocean/snow's rock `ROCK_SCALE_Y` anisotropy) sitting ready in
+`THEMES.ocean.backdrop`, but `mode` stays `'image'` — turning it on is
+flipping that one field once the capture is actually placed and checked, not
+a second wiring pass. `?sp*=` URL overrides still work exactly as before,
+applied per-mount on top of whichever theme's `defaults` are active.
+
+Also fixed in passing: `tuning.opacity` was read from the URL/`defaults` but
+**never actually applied to the mesh** — `mesh.opacity` (a real, live
+`SplatMesh` property) is now set in the same effect that applies scale/
+rotation/position, so `?spopacity=` finally does something.
+
+**Performance: two real, documented `SparkRenderer` levers, plus a
+visibility-based skip — not a downsample, which this version of Spark
+doesn't expose for a pre-baked file.** `PackedSplats`/`SplatMesh`'s own
+`maxSplats` option (checked directly against `node_modules/@sparkjsdev/
+spark`'s source, not just its `.d.ts`) is a *preallocation* hint that grows
+to fit whatever the loaded file actually contains — passing a smaller value
+than the file's own splat count does not drop points, so it is not the
+downsampling knob the brief was hoping for. What Spark does expose, on the
+single shared `SparkRenderer` it auto-attaches to the scene the first time
+any `SplatMesh` renders (`createRendererDetectionMesh` in Spark's own
+source — one instance total, found via `scene.traverse` + `instanceof
+SparkRenderer` since nothing in this codebase constructs one explicitly):
+
+- `minAlpha` (default ≈0.002) → raised to **0.02**: splats below this opacity
+  are skipped before sorting or rasterising at all. A backdrop was never
+  going to read the near-invisible tail of a 1.9M-point cloud as detail.
+- `minPixelRadius` (default 0) → raised to **1.0**: skips splats that would
+  rasterise sub-pixel — the majority of a dense cloud at backdrop distance.
+- `maxStdDev` (default √8 ≈ 2.83) → lowered to **√5 ≈ 2.24**, a value the
+  library's own docs call out by name as a visually-safe performance trade
+  (smaller per-splat footprint, less overdraw).
+
+Set once these become available (`SparkRenderer` doesn't exist yet on the
+frame a `SplatMesh` first mounts; `SplatBackdrop`'s own `useFrame` finds and
+sets it, harmlessly redundantly, until it does).
+
+**Measured before/after in this headless environment** (`?theme=snow`,
+camera at the `shallow` shot placement, a plain `requestAnimationFrame`
+counter over a 12s window, same method `HUD.jsx`'s own `FpsCounter` uses):
+**46.3 fps before → 50.5 fps after**, ~9% faster. This number is more
+meaningful here than the normal-scene case this file's "Headless browser"
+section warns about — splat cost in this environment is dominated by CPU/
+WASM sort time, not GPU rasterisation (the same reason a single splat frame
+costs 100+ seconds regardless of viewport size), so the software rasteriser's
+usual ~1fps ceiling doesn't apply and a real delta is visible. Still not a
+substitute for a real device/GPU measurement.
+
+**The visibility skip** (`SplatBackdrop`'s own `useFrame`) hides the mesh
+(`mesh.visible = false`, not just zero opacity — this drops it from the main
+draw call and, since Spark gates its own per-mesh update on object
+visibility the same way every three.js pass does, from its per-frame sort
+too) whenever the camera is BOTH close (`distance < 9.5`, inside this
+project's own `MIN_DISTANCE` of 8) AND steep/overhead (`polarAngle < 0.65`
+rad, toward `MIN_POLAR_ANGLE`'s 0.38) — deliberately narrow, both conditions
+required: a close-but-overhead view is mostly board and has little sky in
+frame, but a close-and-shallow view still looks straight across the horizon
+at the backdrop even zoomed in, so that case is excluded on purpose. Verified
+directly (not just by inspection) by driving `window.__camera`/`__controls`
+to both a far/shallow and a close/steep placement and reading the live
+mesh's own `.visible` back: `true` at the former, `false` at the latter.
+
 ## RockIsland (formerly Plateau — replaced in Крок 9.6, Section C)
 
 **What the board sits on is a different concept now, not just a different
@@ -1652,6 +2042,63 @@ tileable, so anything with `repeat > 1` there uses `MirroredRepeatWrapping` —
 plain repeat leaves a grid of seams. (The fog noise texture is the
 exception: it's tileable by construction — see "Fog" below — so it uses
 plain `RepeatWrapping`.)
+
+### Крок 16, Section C: the island rendered fully black on Ocean, and why a tint alone could never fix it
+
+**Reported as "the island is solid black," reproduced exactly** (screenshot,
+`?theme=ocean`): the whole rock formation rendered as a near-featureless dark
+shape, not the "dark blue-green" the theme's own palette calls for. It was
+tempting to assume `rockTint` wasn't reaching the material at all (the
+literal brief's own first guess) — it was: `RockIsland.jsx`'s
+`applyRockMaterial` was already reading `ACTIVE_THEME.rockTint` correctly,
+confirmed live (`material.color` read back as `#a1c0bc`, the correct
+retinted value for Ocean's anchor). Forcing `material.side = DoubleSide`
+live via `?debug=1`'s `window.__scene` (ruling out a backface/winding issue,
+which would have shown *something* lit on the reverse faces) made no visual
+difference at all, and geometry-level checks (vertex normal magnitudes,
+`matrixWorld` determinant — confirmed positive, ~1222, matching the expected
+`ROCK_SCALE_XZ² × ROCK_SCALE_Y`) came back clean. The tint, the geometry, and
+the normals were all correct.
+
+**The actual cause: `tools/measure-rock-albedo.mjs` (decodes each theme's
+baked `baseColorTexture` exactly as the browser does, via a live page +
+canvas readback, and reports mean/max luma):**
+
+| theme | mean luma | max luma |
+|---|---|---|
+| mist | 103 | 169 |
+| ocean | **15** | **71** |
+| snow | 121 | 241 |
+
+Ocean's `Basalt Kelp Ledge` texture is **authentically dark basalt** — real
+volcanic rock is dark, and that's correct art direction, not a broken asset.
+The bug is downstream: `MeshStandardMaterial.color` only ever *multiplies*
+the sampled texture. Its maximum effective value is white (i.e. no
+darkening at all) — there is no tint, however light, that can brighten a
+15/255-mean texture into a visibly blue-green rock. Multiplying can only push
+it further toward literal `(0, 0, 0)`, which is what "solid black" actually
+was. Snow's own texture (mean 121) is close enough to Mist's (103) that the
+same multiply pipeline was never actually broken for it — the "остров чорний
+на Snow" half of the brief's own diagnosis turned out to be Крок 16 Section
+B's splat orientation bug obscuring the whole scene, not a rock problem at
+all; once the splat is oriented correctly, Snow's rock was never black.
+
+**The fix is a themed, additive EMISSIVE floor, not a brighter multiply
+(which doesn't exist).** Emissive stacks on top of the diffuse/specular
+response instead of replacing it, so the baked texture's own contours still
+read as relative light/dark variation above the floor — Крок 12 Section D's
+whole point ("the contours are in the texture, not the geometry") still
+holds; only the absolute minimum ever gets lifted.
+`ROCK_ALBEDO_MEAN_LUMA` (the table above, hardcoded — measured once, like
+every other rock-fit constant in this file) and `ROCK_ALBEDO_FLOOR_LUMA`
+(55) together give `ROCK_EMISSIVE_INTENSITY = max(0, (55 - meanLuma) / 255)`:
+**0 for Mist and Snow** (already above the floor, so this is a no-op —
+verified byte-identical screenshots before/after for both) and **≈0.157 for
+Ocean**, tinted with the same `rockTint` the multiply color already uses so
+a lifted-black pixel still reads as this theme's own hue, not a neutral grey
+glow. Verified visually: Ocean's rock now reads as a dark, clearly
+blue-green formation from the same camera angle that previously showed flat
+black.
 
 ## Intro
 
@@ -1867,13 +2314,14 @@ npm install --no-save @gltf-transform/core @gltf-transform/extensions \
 
 | script | what it does |
 |---|---|
-| `decimate-models.mjs` | the asset budget fix. Dry run by default, `--write` applies. Refuses to run twice. |
-| `measure-rock.mjs` | triangle-rasterised top-surface heightfield → the basin floor fit table |
+| `decimate-models.mjs` | the asset budget fix. Dry run by default, `--write` applies. Крок 13: iterates `public/models/{mist,ocean,snow}/`; refuses to run twice **per theme** (backup presence in `assets-src/models-original/<theme>/` gates each theme independently). |
+| `measure-rock.mjs` | triangle-rasterised top-surface heightfield → the basin floor fit table. Takes an optional file arg (defaults to Mist's rock); re-run per theme — see "Крок 13: theme system" for ocean/snow's own numbers. |
+| `measure-rock-albedo.mjs` | Крок 16: decodes each theme's rock `baseColorTexture` via a live page + canvas readback, reports mean/max luma — how the black-island bug (Section C, "RockIsland") was diagnosed as a too-dark source texture, not a broken tint. Optional theme arg, defaults to all three. |
 | `diagnose-mesh.mjs` | why a mesh won't simplify: component count, boundary/non-manifold edges |
 | `sweep-simplify.mjs` | which meshopt flags unlock a given mesh |
 | `shoot.mjs` | screenshots at named camera placements (`shot=shallow\|overhead\|corner\|far\|behind`, `--intro`) |
 | `probe.mjs` | live world-space AABBs of the big meshes, for "does X actually fit Y" |
-| `fogdiag.mjs` | the fog occlusion test + parity stats + dumps the generated fragment shader |
+| `fogdiag.mjs` | the fog occlusion test + parity stats + dumps the generated fragment shader. Крок 13: takes a `THEME` env var (`THEME=ocean node tools/fogdiag.mjs`), defaulting to mist. |
 | `check-mask.mjs` | shoots `/dev-fog?visible=` for a1/b1/g8/c6 — the mask-orientation check |
 
 Output goes to `tools/shots/`, which is gitignored.
@@ -1902,6 +2350,10 @@ Output goes to `tools/shots/`, which is gitignored.
   `window.__pieceMeasurements`. Read `halfWidth` from there rather than
   eyeballing the row: the side-on view shows footprint X, and the piece that
   actually limits `PIECE_SCALE` is limited on Z.
+- `?theme=ocean` / `?theme=snow` (any page — `/`, `/dev-pieces`) switches the
+  active theme; see "Крок 13: theme system". Read once at module load
+  (`lib/themes.js`'s `themeKeyFromUrl()`), same convention as every other
+  `?`-prefixed tuning hook here — no live in-session switch.
 - `?fen=4k3/P7/8/8/8/8/8/4K3 w - - 0 1` puts a white pawn on a7, which is the
   fastest way to open the promotion picker. Clicking anything in the 3D scene
   from a headless browser needs the square's *screen* position: build a

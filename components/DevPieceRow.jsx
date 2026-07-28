@@ -4,7 +4,7 @@ import { OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
 import PieceModel from './PieceModel';
 import Lighting, { ENV_INTENSITY } from './Lighting';
-import { PIECE_CONFIG, PIECE_SCALE } from '../lib/pieces';
+import { PIECE_HEIGHTS, PIECE_SCALE } from '../lib/pieces';
 
 // Ordered tallest -> shortest so the height gradation is easy to eyeball.
 const TYPES = ['king', 'queen', 'bishop', 'knight', 'rook', 'pawn'];
@@ -44,7 +44,7 @@ function Measurer() {
 
         rows.push({
           label,
-          effectiveTarget: +(PIECE_CONFIG[type].targetHeight * PIECE_SCALE).toFixed(4),
+          effectiveTarget: +(PIECE_HEIGHTS[type] * PIECE_SCALE).toFixed(4),
           rawHeight: +(finalHeight / appliedScale).toFixed(4),
           finalHeight: +finalHeight.toFixed(4),
           baseY: +box.min.y.toFixed(4),

@@ -1,6 +1,11 @@
 import { useMemo } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
+import { THEMES, themeKeyFromUrl, rockModelPath } from '../lib/themes';
+
+// Крок 13: same read-once-at-module-load convention as PieceModel.jsx.
+const ACTIVE_THEME_KEY = themeKeyFromUrl();
+const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
 
 /*
  * Крок 9.6, Section C: replaces Plateau.jsx and its whole "continuous ground"
@@ -19,7 +24,7 @@ import { useGLTF } from '@react-three/drei';
  */
 export const SHOW_ROCK_ISLAND = true;
 
-const ROCK_MODEL = '/models/granite-pine-aerie-optimized.glb';
+const ROCK_MODEL = rockModelPath(ACTIVE_THEME_KEY);
 
 // Board slab is 8.6x8.6 (see Board.jsx's boxGeometry) — that footprint, not
 // the 8x8 playing surface inside it, is what the rock's flat top has to clear.
@@ -67,6 +72,57 @@ const PEDESTAL_COLOR = '#241F19';
  */
 const ROCK_ROUGHNESS = 0.92;
 
+/*
+ * Крок 16, Section C: the island rendered fully black on Ocean specifically
+ * — not "wrong tint", genuinely black. Diagnosed with tools/measure-rock-
+ * albedo.mjs (decodes each theme's baked baseColorTexture exactly as the
+ * browser does and reads back mean/max luma via canvas):
+ *
+ *   theme   mean luma   max luma
+ *   mist       103          169
+ *   ocean       15           71
+ *   snow       121          241
+ *
+ * Ocean's "Basalt Kelp Ledge" texture is authentically dark basalt — that's
+ * correct art direction, not a bug in the asset. The bug is downstream:
+ * MeshStandardMaterial's `color` only ever MULTIPLIES the sampled texture
+ * (max effective factor is white, i.e. no darkening at all), so no tint,
+ * however light, can lift a 15/255-mean texture into a visibly blue-green
+ * rock. It can only push it further toward literal (0,0,0), which is what
+ * "the island is solid black" actually was — confirmed by forcing
+ * `material.side = DoubleSide` live (ruling out a backface/winding issue,
+ * which would have shown SOMETHING lit) and finding the fix made no visual
+ * difference at all.
+ *
+ * The fix is a themed, additive EMISSIVE floor — not a brighter multiply,
+ * which doesn't exist. Emissive stacks on top of the diffuse/specular
+ * response instead of replacing it, so the baked texture's own contours
+ * (Крок 12 Section D's whole point — "the contours are in the texture, not
+ * the geometry") still read as relative light/dark variation above the
+ * floor; only the absolute minimum ever gets lifted. Sized per-theme from
+ * the measured mean luma above, so it's a no-op for Mist/Snow (already well
+ * above the floor) and only Ocean's authentically-dark basalt gets lifted.
+ */
+const ROCK_ALBEDO_MEAN_LUMA = { mist: 103, ocean: 15, snow: 121 };
+const ROCK_ALBEDO_FLOOR_LUMA = 55;
+/*
+ * Крок 17: the luma-floor fix above exists purely to rescue Ocean's rock
+ * from reading as literally black — it computes 0 for Snow (already well
+ * above the floor) by design, which is correct for "not black" but leaves
+ * Snow's rock with no deliberate colour identity at all beyond the (now
+ * stronger, see lib/themes.js's rockTintFor) multiply tint. A small
+ * guaranteed emissive floor per theme, independent of the black-rescue
+ * maths, gives Ocean/Snow's rock a visible colour note that survives
+ * regardless of ambient lighting — Mist gets 0 (unchanged; its own bone/
+ * granite look was already tuned without this and doesn't need a colour
+ * "identity" boost the way the two newer themes do).
+ */
+const ROCK_THEME_EMISSIVE_FLOOR = { mist: 0, ocean: 0.12, snow: 0.12 };
+const ROCK_EMISSIVE_INTENSITY = Math.max(
+  ROCK_THEME_EMISSIVE_FLOOR[ACTIVE_THEME_KEY] ?? 0,
+  (ROCK_ALBEDO_FLOOR_LUMA - (ROCK_ALBEDO_MEAN_LUMA[ACTIVE_THEME_KEY] ?? 255)) / 255,
+);
+
 function applyRockMaterial(material) {
   material.roughness = ROCK_ROUGHNESS;
   material.metalness = 0;
@@ -75,7 +131,15 @@ function applyRockMaterial(material) {
   // Mint bakes lighting-neutral albedo, but the map comes in a touch pale
   // against this scene's light key; a mild multiply keeps the granite from
   // reading as white paper without desaturating the green and brown.
-  material.color = new THREE.Color('#B9B4A8');
+  // Крок 13: per-theme tint (lib/themes.js's rockTint) instead of a single
+  // hardcoded value — ocean/snow retint Mist's own tone toward each theme's
+  // dark-square hue/saturation, keeping Mist's lightness.
+  material.color = new THREE.Color(ACTIVE_THEME.rockTint);
+  // Крок 16, Section C: additive floor, themed the same as the multiply tint
+  // above so a lifted-black pixel still reads as this theme's own hue rather
+  // than a neutral grey glow.
+  material.emissive = new THREE.Color(ACTIVE_THEME.rockTint);
+  material.emissiveIntensity = ROCK_EMISSIVE_INTENSITY;
   material.needsUpdate = true;
   return material;
 }
@@ -115,8 +179,33 @@ function applyRockMaterial(material) {
  * it is fitted to the board's HALF-WIDTH in both X and Z (the footprint check
  * above is a square, so the corners are already accounted for).
  */
-const ROCK_FIT_HALF_WIDTH = 0.46;
-const ROCK_FLOOR_Y_RAW = 0.417;
+/*
+ * Крок 13: ocean and snow each shipped their own rock/ledge model
+ * (basalt-kelp-ledge, frosted-granite-ledge) with completely different basin
+ * geometry from Mist's granite-pine-aerie — none of Mist's specific numbers
+ * transfer. Each theme's (halfWidth, floorY) pair below is measured the exact
+ * same way, per-model, via `node tools/measure-rock.mjs
+ * public/models/<theme>/rock-island.glb` (see that file for the "why not a
+ * Box3, why not vertex binning" reasoning) — halfWidth is the last square
+ * footprint with 0 cells poking through the basin floor, floorY is the
+ * histogram-mode top-surface height.
+ *
+ *   theme   halfWidth  floorY   notes
+ *   mist    0.460      0.417    original derivation, granite-pine-aerie
+ *   ocean   0.370      0.271    basalt-kelp-ledge — a much shallower, wider
+ *                               ledge than mist's basin (raw rim only 0.073
+ *                               above floor vs mist's ~0.25+), reads as flat
+ *                               kelp-covered shelf rather than a deep bowl
+ *   snow    0.410      0.577    frosted-granite-ledge — closer to mist's own
+ *                               proportions (X/Z aspect 1.161 vs mist 1.164)
+ */
+const ROCK_FIT = {
+  mist: { halfWidth: 0.46, floorY: 0.417 },
+  ocean: { halfWidth: 0.37, floorY: 0.271 },
+  snow: { halfWidth: 0.41, floorY: 0.577 },
+};
+const ROCK_FIT_HALF_WIDTH = ROCK_FIT[ACTIVE_THEME_KEY].halfWidth;
+const ROCK_FLOOR_Y_RAW = ROCK_FIT[ACTIVE_THEME_KEY].floorY;
 const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
 
 /*
@@ -131,8 +220,18 @@ const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
  * scene exactly where the existing camera clamps were verified against, so this
  * change cannot reopen that question: the rock simply becomes a wider, shallower
  * bowl. On an irregular rock formation the anisotropy is not readable as one.
+ *
+ * Ocean/snow reuse Mist's own Y/XZ anisotropy RATIO (7.277/9.3478 = 0.7785)
+ * rather than Mist's raw ROCK_SCALE_Y — their basins sit at a different raw
+ * scale (ROCK_SCALE_XZ above differs per theme), so copying the absolute
+ * number would not preserve the same "wide, shallow bowl" proportions Mist's
+ * derivation solved for. This has not been re-verified against the camera
+ * clamps the way Mist's was (see CLAUDE.md); it is a proportionate default,
+ * not a re-derivation — flag before relying on it if the rim reads wrong at a
+ * shallow camera angle in either new theme.
  */
-const ROCK_SCALE_Y = 7.277;
+const MIST_Y_XZ_RATIO = 7.277 / (4.3 / 0.46);
+const ROCK_SCALE_Y = ACTIVE_THEME_KEY === 'mist' ? 7.277 : ROCK_SCALE_XZ * MIST_Y_XZ_RATIO;
 const ROCK_Y_OFFSET = Y - ROCK_FLOOR_Y_RAW * ROCK_SCALE_Y;
 
 /*
