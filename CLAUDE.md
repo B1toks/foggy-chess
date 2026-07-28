@@ -732,6 +732,92 @@ snow-specific painting. Worth a real Mint-generated still frame later if the
 generic fallback (visible whenever the splat times out or errors) reads as a
 mismatch.
 
+## Крок 17: fog flashed fully-fogged specifically on the Start-button transition
+
+Reported as "own pieces briefly appear under fog when starting a new game."
+Крок 16 Section A's fix (seed the mask's `effective` array from the real
+starting `visibility` instead of a blanket "everything hidden" fill) held up
+for a fresh page load with the intro pre-skipped, but not for the actual
+everyday path: clicking "Begin" on the intro screen. Reproduced identically
+against both `next dev` and a production `next build` via a real Start-
+button click (`.intro-begin-button`, dispatched programmatically per the
+"Headless browser" section below), so this is not a Strict Mode artifact.
+
+The cause: `<Fog>` doesn't exist in the tree during `'intro'`/
+`'transitioning'` (Крок 12, Section B — no fog on the intro) and mounts for
+the first time exactly when phase flips to `'playing'`, **into an r3f render
+loop that has already been ticking `useFrame` for several seconds** (the
+intro camera rig's own animation). A fresh page load has enough natural
+startup latency (WebGL context setup, model loading via Suspense) that
+`FogShader`'s mount-time wave-scheduling `useEffect` reliably runs before the
+first `useFrame` tick. Mounting into an already-spinning loop has no such
+guarantee — a `useFrame` call landing before that `useEffect` reads the
+untouched `Float32Array` defaults (`oldValue`/`newValue` both 0) for every
+square, including ones just seeded to `effective = 1`, and overwrites them
+back to 0. By the time the scheduling effect *does* run, it reads that
+already-corrupted 0 as the wave's `oldValue`, schedules a real 1.4s
+reveal-from-black, and the player's own pieces spend that whole span under
+fog. Confirmed empirically via `window.__fogWave` (see "QA hooks"): a real
+Start click showed `oldValue: 0, newValue: 1` for a starting-visible square,
+where a plain page load showed `oldValue: 1, newValue: 1` (a no-op) for the
+same square.
+
+Fixed by making the mask-building `useMemo` fully self-sufficient: it already
+runs synchronously during render, strictly before any paint or `useFrame`
+callback can fire, so it now seeds `oldValue`/`newValue`/`prevVisible` there
+too, not just `effective`. With `prevVisible` pre-populated to match the real
+starting `visibility`, the scheduling effect's `wasVisible === isVisible`
+check skips every square on its first run — nothing is scheduled, because
+the seed already put every square exactly at its target. Verified fixed
+against a production build via the same real Start-click method: `oldValue:
+1, newValue: 1, effective: 1` on the very first readable frame.
+
+## Крок 18: the splat/painted-backdrop question resolved per theme
+
+Ocean and Snow briefly gained Gaussian-splat backdrops during this pass
+(matching Snow's existing one), diagnosed and fixed two real issues along
+the way — Mist's own splat capture is actually Y-up already (unlike Snow's,
+which needed the documented `rotX -90` fix), so copying Snow's correction
+onto Mist was itself the bug, not a fix; and post-load splat count reduction
+via Spark's `constructSplats` hook (`SplatBackdrop.jsx`'s `downsampleSplats`,
+default keeps 35%, `?spkeep=` overrides) is a real, verified VRAM/perf lever
+that survives for any splat re-enabled later.
+
+Both were reverted anyway before shipping: a real device reported 20fps and
+90% VRAM usage with a splat active, a cost this headless environment cannot
+verify or contradict (see "Headless browser"), and Mist's own capture was
+independently found to have already been attempted and abandoned three
+times before the theme system even existed (see the Gaussian splat backdrop
+section above — scale 12, 2, and 1 all rejected). Two more reasoned
+placement attempts this pass (identity rotation, scale/offset aimed at the
+capture's own documented open-ground region) still read as cluttered rather
+than a clean vista under the island. Not worth further time under a real
+performance signal already pointing away from splats as the default for
+three themes at once.
+
+**Instead, every theme now has its own painted panorama**, closing the gap
+where only Mist had one and Ocean/Snow fell back to the generic procedural
+`Mountains` ridges. Two new Mint-generated sumi-e images
+(`public/textures/ocean-valley.png`, `public/textures/snow-valley.png`,
+matching Mist's `mountains.jpg` in style but not in aspect ratio — Mint
+doesn't guarantee one across separate generations) plug into the *same*
+segment mechanism Mist's painting already used (`BACKDROP_SEGMENTS`, two
+mirrored copies of one frame to close the full 360-degree orbit — see
+"Крок 9.5, Section B" above), which `Backdrop.jsx` generalized from
+Mist-only to theme-generic: `USES_PAINTING` now checks
+`ACTIVE_THEME.backdrop.image` instead of `ACTIVE_THEME_KEY === 'mist'`, and
+`ImageBackdropSegment` derives its cylinder height from the *loaded
+texture's own* `image.width`/`image.height` instead of one hardcoded
+`IMAGE_ASPECT` constant, since the three images are no longer the same
+shape. `BACKDROP_MODE`, `IS_MIST`, and `USES_MIST_SPLAT` are gone — a single
+`USES_THEME_SPLAT` check (still `mode === 'splat'`, currently true for no
+theme) covers every theme uniformly now.
+
+All three themes' `backdrop.splat` transforms are left in `lib/themes.js`
+as a starting point, not deleted — re-enabling any one of them later is a
+one-line `mode: 'image' -> 'splat'` change, same as before this pass, should
+a real-device perf budget ever justify it.
+
 ## Architecture
 
 ```

@@ -13,10 +13,11 @@ const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
 
 /*
  * Lazy, not a static import. @sparkjsdev/spark is 482 KB in the client bundle —
- * more than the painting it would replace — and BACKDROP_MODE is not 'splat'.
- * A static import ships all of it to every player for a disabled feature; a
- * dynamic one makes webpack emit it as an async chunk that is only ever
- * fetched if something actually renders it.
+ * more than any of the current painted panoramas — and no theme currently
+ * sets `backdrop.mode: 'splat'` (see USES_THEME_SPLAT below). A static import
+ * ships all of it to every player for a disabled feature; a dynamic one makes
+ * webpack emit it as an async chunk that is only ever fetched if something
+ * actually renders it.
  */
 const SplatBackdrop = lazy(() => import('./SplatBackdrop'));
 
@@ -43,59 +44,26 @@ function isLowPowerDevice() {
 
 /**
  * 'procedural' — the canvas-generated ridge shells in Mountains.jsx.
- * 'image'      — the panoramic sumi-e painting wrapped behind the scene.
- * 'splat'      — the Gaussian-splat capture of the valley, with 'image'
+ * 'image'      — a panoramic sumi-e painting wrapped behind the scene.
+ * 'splat'      — a Gaussian-splat capture of the valley, with 'image'
  *                underneath it as the instant-loading floor.
  *
- * This one constant is the rollback for the whole section. All three
- * implementations stay in the codebase and stay working.
- *
- * 'splat' is wired up, loads, and renders — but it is NOT the default, because
- * the capture has not been *placed* yet and unplaced it looks worse than the
- * painting. See "Gaussian splat backdrop" in CLAUDE.md for the numbers already
- * measured off the file and the URL knobs for dialling it in live. Flip this to
- * 'splat' and tune it in a real browser; it needs a GPU and an eye, not a
- * headless screenshot.
- *
- * Крок 13: this constant is scoped to MIST's own content now, not a global
- * switch — ocean/snow have no painted valley panorama of their own, so any
- * theme other than mist always renders the procedural Mountains shells as its
- * base (see IS_MIST/USES_PAINTING below), independent of this value. A
- * theme's own splat (THEMES[key].backdrop, lib/themes.js) is a separate
- * concern layered on top of that base — see USES_THEME_SPLAT.
- *
- * Крок 17: tried flipping this to 'splat' again — Mist's own capture had
- * already been attempted and abandoned three times before this project's
- * theme system even existed (see "What was tried and rejected" further down
- * this file's history / CLAUDE.md's Gaussian splat section: scale 12, scale
- * 2, scale 1, all rejected). This capture's own measured extent is already
- * Y-up (unlike snow's, which needed the rotX -90 Z-up correction — applying
- * that same fix here was itself wrong and produced a sideways wall, not a
- * misapplied-but-close attempt), so two further reasoned placements were
- * tried this pass (identity rotation, two different scale/offset pairs
- * aimed at the capture's own documented open-ground region) — both still
- * read as cluttered/buried rather than a clean vista below the island.
- * Reverted to 'image' rather than spend more time on a capture this
- * project's own history already flags as difficult to place. If a future
- * session wants another attempt, do it live in a real browser with `?sp*=`
- * overrides — this is exactly the kind of placement CLAUDE.md already warns
- * cannot be judged from a headless screenshot.
+ * Крок 13 originally scoped painting to Mist alone — ocean/snow had no
+ * painted panorama of their own, so they always fell back to the procedural
+ * Mountains shells regardless of their own `backdrop.mode`. Крок 18 gives
+ * every theme its own Mint-generated panorama (`lib/themes.js`'s
+ * `backdrop.image`, matching Mist's sumi-e style), so painting is now
+ * theme-generic: any theme with an `image` set uses it, the same way any
+ * theme with `mode: 'splat'` layers its own splat on top (USES_THEME_SPLAT
+ * below). A theme with no `image` still falls back to Mountains, so that
+ * rollback path stays live even though nothing currently exercises it.
  */
-export const BACKDROP_MODE = 'image';
-
-const IS_MIST = ACTIVE_THEME_KEY === 'mist';
-/** True for any mode that puts MIST's own painted cylinder in the scene. */
-const USES_PAINTING = IS_MIST && (BACKDROP_MODE === 'image' || BACKDROP_MODE === 'splat');
+const USES_PAINTING = Boolean(ACTIVE_THEME.backdrop.image) && ACTIVE_THEME.backdrop.mode !== 'procedural';
 // Крок 17: computed once at module load (this file is only ever imported
 // client-side, same as ACTIVE_THEME_KEY above) — a phone/coarse-pointer
 // device never mounts a backdrop splat for any theme, full stop.
 const IS_LOW_POWER = isLowPowerDevice();
-const USES_MIST_SPLAT = IS_MIST && BACKDROP_MODE === 'splat' && !IS_LOW_POWER;
-// Крок 13: snow's own splat (public/ink-wash-snow-plateau-*.spz), independent
-// of Mist's BACKDROP_MODE rollback knob above.
 const USES_THEME_SPLAT = ACTIVE_THEME.backdrop.mode === 'splat' && !IS_LOW_POWER;
-
-export const BACKDROP_IMAGE = '/textures/mountains.jpg';
 
 /*
  * The painting is a single 2560x1429 frame, NOT a seamless 360 panorama, so it
@@ -115,8 +83,13 @@ export const BACKDROP_IMAGE = '/textures/mountains.jpg';
  * and the skyline sits 20% down the image (measured off the luminance profile:
  * rows 0-10% are flat sky at ~227, the far ridges break in around 20%), so
  *   TOP_Y = y_skyline + 0.20 * HEIGHT
+ *
+ * Крок 18: no longer one hardcoded aspect ratio. Each theme now brings its
+ * own image at its own native size (Mist 2560x1429, Ocean 1584x672, Snow
+ * 1376x768 — Mint doesn't guarantee a common aspect across separate
+ * generations), so ImageBackdropSegment derives it from the loaded
+ * texture's own `image.width`/`image.height` instead of a module constant.
  */
-const IMAGE_ASPECT = 2560 / 1429;
 // Exported for anything else that needs to reason about the segment's own
 // radius without a second, driftable copy of the number (Крок 8/9's ground
 // extension used to be that caller; it's gone as of Крок 9.6, Section C —
@@ -158,27 +131,28 @@ export const AZIMUTH_SWING = THREE.MathUtils.degToRad(30);
  * meshes, so where two overlap it's just two fading edges compositing on top
  * of each other — not a seam to solve for, per the brief.
  *
- * Two segments today, both the *same* painting (`BACKDROP_IMAGE`) — one at
- * its natural azimuth, one rotated 180 degrees and mirrored the other way —
- * are the temporary stand-in the brief asked for while a second Mint frame
- * doesn't exist yet. It already fully closes the circle: each arc is 200
- * degrees (+/-100 from its own centre), the two centres are 180 degrees
+ * Two segments today, both the *same* painting (the active theme's own
+ * `backdrop.image`) — one at its natural azimuth, one rotated 180 degrees
+ * and mirrored the other way — are the stand-in every theme uses while each
+ * only has one Mint frame. It already fully closes the circle: each arc is
+ * 200 degrees (+/-100 from its own centre), the two centres are 180 degrees
  * apart, so segment A's far edge (its centre +100) lands 20 degrees past
  * segment B's near edge (its centre -100) — every azimuth falls inside at
  * least one of the two, with two ~20-degree bands (near each pair of edges)
  * inside both. Heavy fog and the edge fades on both sides make the repeated,
  * mirrored painting hard to spot in practice.
  *
- * The real fix is swapping in two more Mint-generated frames of the same
- * valley and moving ARC_DEG-per-segment toward the brief's ~140 degrees each
+ * The real fix is generating two more Mint frames of the same valley per
+ * theme and moving ARC_DEG-per-segment toward the brief's ~140 degrees each
  * with the same overlap logic — nothing about this array's *shape* needs to
  * change for that, only its contents (see the TODO comment on the second
- * entry below).
+ * entry below). Recomputed per theme (module scope, same convention as
+ * ACTIVE_THEME itself) since `src` now depends on which theme is active.
  */
 export const BACKDROP_SEGMENTS = [
   {
     id: 'valley-main',
-    src: BACKDROP_IMAGE,
+    src: ACTIVE_THEME.backdrop.image,
     // The direction the camera looks at rest (see ImageBackdropSegment's old
     // `center` derivation, now per-segment) — unchanged from before this
     // section existed, so the default view is pixel-identical to Крок 8.
@@ -187,13 +161,13 @@ export const BACKDROP_SEGMENTS = [
     flip: true,
   },
   {
-    // TODO(when a second Mint frame exists): replace `src` with it, and
-    // retune `azimuth`/`arcDeg` (and the third segment alongside it) toward
-    // three ~140-degree arcs with overlap, per the brief. Until then this is
-    // not a placeholder for any *specific* future segment — just enough
-    // cover that a full orbit never shows open dome.
+    // TODO(when a second Mint frame exists per theme): replace `src` with
+    // it, and retune `azimuth`/`arcDeg` (and a third segment alongside it)
+    // toward three ~140-degree arcs with overlap, per the brief. Until then
+    // this is not a placeholder for any *specific* future segment — just
+    // enough cover that a full orbit never shows open dome.
     id: 'valley-mirror-placeholder',
-    src: BACKDROP_IMAGE,
+    src: ACTIVE_THEME.backdrop.image,
     azimuth: HOME_AZIMUTH,
     arcDeg: ARC_DEG,
     // Opposite of the main segment's flip: combined with the 180-degree
@@ -256,6 +230,11 @@ function ImageBackdropSegment({ segment, tuning }) {
    * decode).
    */
   const texture = useMemo(() => rawTexture.clone(), [rawTexture]);
+  // Крок 18: per-theme images no longer share one aspect ratio — read it off
+  // the loaded texture itself (useTexture/useMemo above already guarantee
+  // rawTexture.image is populated by the time this runs) instead of a
+  // hardcoded module constant.
+  const imageAspect = rawTexture.image.width / rawTexture.image.height;
 
   /*
    * The eye the framing is solved against is CameraRig's *resting* position for
@@ -275,7 +254,7 @@ function ImageBackdropSegment({ segment, tuning }) {
   const geo = useMemo(() => {
     const radius = tuning.radius ?? RADIUS;
     const arc = THREE.MathUtils.degToRad(tuning.arcDeg ?? segment.arcDeg);
-    const height = (radius * arc) / IMAGE_ASPECT;
+    const height = (radius * arc) / imageAspect;
     const elevation = THREE.MathUtils.degToRad(tuning.elevation ?? SKYLINE_ELEVATION_DEG);
     const skylineY = eyeY - (radius + eyeRadius) * Math.tan(elevation);
     const topY = tuning.topY ?? skylineY + SKYLINE_FRACTION * height;
@@ -290,7 +269,7 @@ function ImageBackdropSegment({ segment, tuning }) {
       centerY: topY - height / 2,
       thetaStart: segment.azimuth - arc / 2,
     };
-  }, [tuning, eyeY, eyeRadius, segment.arcDeg, segment.azimuth]);
+  }, [tuning, eyeY, eyeRadius, segment.arcDeg, segment.azimuth, imageAspect]);
 
   useEffect(() => {
     texture.colorSpace = THREE.SRGBColorSpace;
@@ -413,10 +392,9 @@ export default function Backdrop() {
       <>
         <SkyDome />
         <Mountains />
-        {/* Крок 13: a theme's own splat (currently only snow — see
-            THEMES.snow.backdrop in lib/themes.js) renders in addition to the
-            procedural floor above, never instead of it — same "never throw
-            upward" contract Mist's own splat already established. */}
+        {/* A theme's own splat (THEMES[key].backdrop.mode === 'splat' — none
+            currently, see Крок 17/18 in CLAUDE.md for why) renders in
+            addition to the procedural floor above, never instead of it. */}
         {USES_THEME_SPLAT && (
           <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
         )}
@@ -440,10 +418,10 @@ export default function Backdrop() {
       ) : (
         <Mountains />
       )}
-      {/* Mounted on top of the painting, not instead of it. 32 MB takes a while
-          and may not arrive at all; the painted cylinder is the floor under it
-          and costs 434 KB. */}
-      {USES_MIST_SPLAT && (
+      {/* Mounted on top of the painting, not instead of it. Tens of MB takes a
+          while and may not arrive at all; the painted cylinder is the floor
+          under it and costs well under a MB. */}
+      {USES_THEME_SPLAT && (
         <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
       )}
     </>
