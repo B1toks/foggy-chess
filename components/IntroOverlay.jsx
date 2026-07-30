@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { THEMES, themeKeyFromUrl } from '../lib/themes';
+import { THEMES } from '../lib/themes';
 
 /*
  * Крок 8, Section B: replaces the old TitleScreen. That version carried its
@@ -58,25 +58,18 @@ const TITLE_SIZE = 'clamp(1.9rem, 7vw, 3.6rem)';
 
 /*
  * Крок 14, Section B: "Change Theme" (GameOverScreen.jsx) sends the player
- * back here, to the one screen that offers a theme choice. Themes are read
- * once at module load across lib/fog.js, PieceModel.jsx, RockIsland.jsx etc.
- * (see lib/themes.js's own header comment), so picking one is a real page
- * navigation with `?theme=` set, not a React state change — nothing here
- * tries to hot-swap live.
+ * back here, to the one screen that offers a theme choice.
+ *
+ * Крок 19: used to be a full page navigation with `?theme=` set — every
+ * themed module read `themeKeyFromUrl()` once at its own module load, so a
+ * plain URL/state change couldn't reach any of them (see git history). Theme
+ * is a live `themeKey` prop threaded down from GameCanvas now, same as
+ * everywhere else it's picked (HUD.jsx's mid-game switcher), so this picker
+ * just calls `onThemeChange` — no navigation, and the intro's own camera
+ * animation/audio keep running uninterrupted while the scene underneath
+ * re-themes.
  */
-function setThemeAndReload(key) {
-  try {
-    const url = new URL(window.location.href);
-    url.searchParams.set('theme', key);
-    window.location.href = url.toString();
-  } catch {
-    // Non-fatal — worst case the picker just doesn't navigate.
-  }
-}
-
-function ThemePicker() {
-  const active = themeKeyFromUrl();
-
+function ThemePicker({ activeTheme, onThemeChange }) {
   return (
     <div
       style={{
@@ -91,8 +84,8 @@ function ThemePicker() {
       {Object.entries(THEMES).map(([key, theme]) => (
         <button
           key={key}
-          onClick={() => setThemeAndReload(key)}
-          className={`intro-theme-button${key === active ? ' active' : ''}`}
+          onClick={() => onThemeChange(key)}
+          className={`intro-theme-button${key === activeTheme ? ' active' : ''}`}
           style={{
             fontFamily: 'var(--font-ui), system-ui, sans-serif',
             fontSize: 11,
@@ -110,7 +103,7 @@ function ThemePicker() {
   );
 }
 
-export default function IntroOverlay({ onStart }) {
+export default function IntroOverlay({ onStart, activeTheme, onThemeChange }) {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Enter' || e.key === ' ' || e.key === 'Escape') onStart();
@@ -260,7 +253,7 @@ export default function IntroOverlay({ onStart }) {
         >
           You play White
         </div>
-        <ThemePicker />
+        <ThemePicker activeTheme={activeTheme} onThemeChange={onThemeChange} />
       </TextScrim>
     </div>
   );

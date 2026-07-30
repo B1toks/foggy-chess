@@ -187,7 +187,7 @@ function useAnimatedInstances(board, lastMove, historyLength, visibility) {
  * mount a reveal" — a value that must never change for the life of this
  * component instance.
  */
-function AnimatedPieceGroup({ type, color, square, lifted, revealDelay }) {
+function AnimatedPieceGroup({ type, color, square, lifted, revealDelay, themeKey }) {
   const outerRef = useRef(null);
   const liftRef = useRef(null);
   const currentSquare = useRef(square);
@@ -265,14 +265,14 @@ function AnimatedPieceGroup({ type, color, square, lifted, revealDelay }) {
   return (
     <group ref={outerRef}>
       <group ref={liftRef}>
-        <PieceModel type={type} color={color} fade={revealFade} />
+        <PieceModel type={type} color={color} fade={revealFade} themeKey={themeKey} />
       </group>
     </group>
   );
 }
 
 /** A captured piece, fading out in place rather than vanishing on the spot. */
-function CaptureGhost({ type, color, square, onDone }) {
+function CaptureGhost({ type, color, square, onDone, themeKey }) {
   const groupRef = useRef(null);
   const elapsed = useRef(0);
   const [x, y, z] = squareToWorld(square);
@@ -296,7 +296,7 @@ function CaptureGhost({ type, color, square, onDone }) {
           instead of the shared BONE/LACQUER singletons every live piece
           uses — those are shared across every piece of that colour, so
           animating opacity on one would fade all of them. */}
-      <PieceModel type={type} color={color} fade />
+      <PieceModel type={type} color={color} fade themeKey={themeKey} />
     </group>
   );
 }
@@ -308,6 +308,7 @@ export default function Pieces({
   historyLength,
   selectedSquare,
   hoveredSquare,
+  themeKey,
 }) {
   const { instances, ghosts, removeGhost } = useAnimatedInstances(
     board,
@@ -343,6 +344,7 @@ export default function Pieces({
               square={inst.square}
               lifted={lifted}
               revealDelay={revealDelay}
+              themeKey={themeKey}
             />
           );
         })}
@@ -354,6 +356,7 @@ export default function Pieces({
             color={ghost.color}
             square={ghost.square}
             onDone={() => removeGhost(ghost.key)}
+            themeKey={themeKey}
           />
         ))}
       </group>

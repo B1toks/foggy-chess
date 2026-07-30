@@ -19,7 +19,6 @@ import {
   FOG_INITIAL_SEED_FRACTION,
   FOG_LIGHT_STEP,
   FOG_LIGHT_UV,
-  FOG_LIT_COLOR,
   FOG_MARCH_STEPS,
   FOG_MAX_ALPHA,
   FOG_NOISE_SCALE_DETAIL,
@@ -28,20 +27,22 @@ import {
   FOG_NOISE_STRETCH_V,
   FOG_REVEAL_THICKEN_DURATION,
   FOG_SHADE_GAIN,
-  FOG_SHADOW_COLOR,
   FOG_SLAB_HEIGHT,
   FOG_SLAB_OVERHANG,
-  FOG_TINT_COLOR,
   FOG_VERTICAL_FALLOFF,
   FOG_VOLUME_MAX_ALPHA,
   FOG_WAVE_DELAY_PER_CELL,
   FOG_WAVE_DURATION,
+  fogColorsForTheme,
   squareChebyshevDistance,
   squareChebyshevDistanceFromCenter,
   squareToMaskIndex,
 } from '../lib/fog';
 import { easeOutCubic } from '../lib/easing';
 import { getFogNoiseTexture } from './proceduralTextures';
+import { themeKeyFromUrl } from '../lib/themes';
+
+const INITIAL_THEME_KEY = themeKeyFromUrl();
 
 /*
  * ARCHITECTURE, and the two previous ones it replaced.
@@ -590,15 +591,16 @@ function sceneDepthSizeForDevice() {
   return isLowPower ? SCENE_DEPTH_SIZE_MOBILE : SCENE_DEPTH_SIZE;
 }
 
-function makeFogMaterial(mask, noiseTex, marchSteps, sceneDepth) {
+function makeFogMaterial(mask, noiseTex, marchSteps, sceneDepth, themeKey) {
+  const colors = fogColorsForTheme(themeKey);
   return new THREE.ShaderMaterial({
     uniforms: {
       uMask: { value: mask },
       uNoiseTex: { value: noiseTex },
       uTime: { value: 0 },
-      uColorShadow: { value: new THREE.Color(FOG_SHADOW_COLOR) },
-      uColorLit: { value: new THREE.Color(FOG_LIT_COLOR) },
-      uTint: { value: new THREE.Color(FOG_TINT_COLOR) },
+      uColorShadow: { value: new THREE.Color(colors.shadow) },
+      uColorLit: { value: new THREE.Color(colors.lit) },
+      uTint: { value: new THREE.Color(colors.tint) },
       // Normalised in JS rather than in GLSL: it is a constant, and normalize()
       // per pixel for a value that never changes is pure waste.
       uLightUv: {
@@ -672,7 +674,12 @@ function useWaveState() {
   });
 }
 
-export default function FogShader({ visibility, lastMove = null, enemyPieceSquares = null }) {
+export default function FogShader({
+  visibility,
+  lastMove = null,
+  enemyPieceSquares = null,
+  themeKey = INITIAL_THEME_KEY,
+}) {
   const wave = useWaveState();
   const meshRef = useRef(null);
 
@@ -765,13 +772,32 @@ export default function FogShader({ visibility, lastMove = null, enemyPieceSquar
 
     return {
       mask: texture,
-      material: makeFogMaterial(texture, noiseTex, marchStepsForDevice(), depthTarget.depthTexture),
+      material: makeFogMaterial(texture, noiseTex, marchStepsForDevice(), depthTarget.depthTexture, themeKey),
     };
     // depthTarget is stable for the component's lifetime (useFBO's own memo
     // never recreates it from a resize, only target.setSize() mutates it in
-    // place), so it's deliberately not a dependency here.
+    // place), so it's deliberately not a dependency here. themeKey is read
+    // once here too — this useMemo runs exactly once at mount (see the
+    // Крок 16/17 comment above), so it only ever captures whichever theme
+    // was active at that moment; see the useEffect below for what keeps the
+    // colour live after that.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /*
+   * Крок 19: live theme switching. The fog's three colour uniforms are
+   * cheap to update in place — no shader recompile, no material/mesh
+   * recreation — so a theme change just re-points them at the new theme's
+   * palette instead of rebuilding anything. Everything else about the
+   * material (mask texture, noise texture, march step count, scene-depth
+   * target) is genuinely mount-once and stays that way.
+   */
+  useEffect(() => {
+    const colors = fogColorsForTheme(themeKey);
+    material.uniforms.uColorShadow.value.set(colors.shadow);
+    material.uniforms.uColorLit.value.set(colors.lit);
+    material.uniforms.uTint.value.set(colors.tint);
+  }, [themeKey, material]);
 
   useEffect(
     () => () => {

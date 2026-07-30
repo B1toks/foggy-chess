@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { isAudioEnabled, setAudioEnabled } from './audio';
 import { GAME_OVER_STATUSES } from '../lib/useChessGame';
-import { THEMES, themeKeyFromUrl } from '../lib/themes';
+import { THEMES } from '../lib/themes';
+import { preloadThemeModels } from './PieceModel';
 
 // Flip to true (or append ?debug=1) to bring back the vision readout.
 const SHOW_DEBUG = false;
@@ -77,78 +78,38 @@ function NewGameButton({ onNewGame, prominent }) {
 
 /*
  * Крок 16, Section D: theme switching mid-game, not just from the title or
- * game-over screens (Крок 14/15's ThemePicker in IntroOverlay.jsx /
- * GameOverScreen.jsx's "Change Theme" — both unchanged, both still reset to
- * a brand new game on purpose, since that's the point of "change theme" from
- * either of those screens). This is a THIRD, additive entry point: pick a
- * theme without losing the game in progress.
+ * game-over screens (ThemePicker in IntroOverlay.jsx / GameOverScreen.jsx's
+ * "Change Theme" — both unchanged, both still reset to a brand new game on
+ * purpose, since that's the point of "change theme" from either of those
+ * screens). This is a THIRD, additive entry point: pick a theme without
+ * losing the game in progress.
  *
- * WHY THIS IS STILL A FULL RELOAD, and why that's not a compromise on "the
- * game state is preserved": every themed module in this codebase
- * (lib/fog.js, lib/themes.js's own consumers — PieceModel.jsx,
- * RockIsland.jsx, Board.jsx, Backdrop.jsx) reads `themeKeyFromUrl()` ONCE at
- * module load and holds it in a module-level constant, by design (see
- * lib/themes.js's own header comment and CLAUDE.md's Крок 13 notes) — a
- * pushState-only URL change would not cause any of them to re-evaluate.
- * Converting every one of those into a reactive (context/prop-driven) read
- * is a real architectural change, not this task.
+ * Крок 19: this used to be a full page reload (see git history) — every
+ * themed module read `themeKeyFromUrl()` once at its own module load, so a
+ * URL change alone couldn't reach any of them. That is no longer true: theme
+ * is now a plain `themeKey` prop threaded down from GameCanvas
+ * (`onThemeChange` here is that state's setter), so picking one just
+ * re-renders the scene with a new prop — no navigation, no reload, and
+ * nothing about the game (history, camera, selection) is lost, because
+ * nothing ever unmounts.
  *
- * So this navigates, same as the existing "Change Theme" flows — but carries
- * the CURRENT position across as `?fen=`, which useChessGame already
- * supports as an initial-state hook (see its own `initialFen` param). The
- * reload lands on a fresh chess.js instance at the same position, same turn,
- * same castling/en-passant rights — everything a player can actually see or
- * that affects legal moves going forward. The one thing that does NOT
- * survive is chess.js's own move-history array, which nothing downstream
- * depends on for correctness: it only ever feeds the move/capture SOUND
- * trigger (compares history.length against its own last-seen value, which
- * also resets to 0 on the fresh mount, so no false triggers) and the fog
- * wave's origin square (lastMove null after a reload just means "no wave
- * origin, settle in place" — already a handled, ordinary case, not an
- * error). `INTRO_SEEN_KEY` is untouched by this reload, so it lands straight
- * on 'playing', not the intro cinematic.
+ * The cooldown is much shorter now (was 10s, covering full-reload latency
+ * that no longer exists) and is plain component state instead of
+ * sessionStorage-backed — there is no reload for it to need to survive
+ * anymore. It still exists at all only to stop rapid re-clicking from
+ * queueing overlapping GLTF/texture loads for several themes at once.
  */
-const THEME_SWITCH_COOLDOWN_KEY = 'dead-reckoning:theme-switch-at';
-const THEME_SWITCH_COOLDOWN_MS = 10000;
+const THEME_SWITCH_COOLDOWN_MS = 2000;
 
-function remainingThemeSwitchCooldownMs() {
-  try {
-    const at = Number(window.sessionStorage.getItem(THEME_SWITCH_COOLDOWN_KEY));
-    if (!at) return 0;
-    return Math.max(0, THEME_SWITCH_COOLDOWN_MS - (Date.now() - at));
-  } catch {
-    return 0;
-  }
-}
-
-function switchThemeMidGame(key, fen) {
-  try {
-    window.sessionStorage.setItem(THEME_SWITCH_COOLDOWN_KEY, String(Date.now()));
-    const url = new URL(window.location.href);
-    url.searchParams.set('theme', key);
-    url.searchParams.set('fen', fen);
-    window.location.href = url.toString();
-  } catch {
-    // Non-fatal — worst case the button just doesn't navigate, and the
-    // cooldown timestamp (if it did get written) self-expires in 10s.
-  }
-}
-
-function ThemeSwitcherButton({ fen }) {
+function ThemeSwitcherButton({ activeTheme, onThemeChange }) {
   const [open, setOpen] = useState(false);
-  // Lazy init from sessionStorage so a page reloaded mid-cooldown (exactly
-  // what switching theme itself does) keeps counting down instead of
-  // resetting the button to immediately-usable — the whole point of a
-  // cooldown that survives the very action it's gating.
-  const [remaining, setRemaining] = useState(remainingThemeSwitchCooldownMs);
+  const [remaining, setRemaining] = useState(0);
 
-  // Ticks every 100ms off the stored timestamp rather than a local counter,
-  // so it stays correct even if the tab was backgrounded (setInterval drift)
-  // — re-reading sessionStorage each tick is cheap and self-correcting.
   useEffect(() => {
-    const id = setInterval(() => setRemaining(remainingThemeSwitchCooldownMs()), 100);
+    if (remaining <= 0) return undefined;
+    const id = setInterval(() => setRemaining((r) => Math.max(0, r - 100)), 100);
     return () => clearInterval(id);
-  }, []);
+  }, [remaining > 0]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -162,9 +123,30 @@ function ThemeSwitcherButton({ fen }) {
     };
   }, [open]);
 
+  // Крок 19: warm every other theme's piece GLBs into drei's loader cache
+  // the instant the panel opens — by the time the player actually clicks an
+  // option a beat later, the model swap resolves near-instantly instead of
+  // visibly re-suspending. Harmless to call repeatedly (useGLTF.preload is
+  // itself idempotent against its own cache).
+  useEffect(() => {
+    if (!open) return;
+    for (const key of Object.keys(THEMES)) {
+      if (key !== activeTheme) preloadThemeModels(key);
+    }
+  }, [open, activeTheme]);
+
   const onCooldown = remaining > 0;
-  const activeTheme = themeKeyFromUrl();
   const secondsLeft = Math.ceil(remaining / 1000);
+
+  function pick(key) {
+    if (key === activeTheme) {
+      setOpen(false);
+      return;
+    }
+    onThemeChange(key);
+    setOpen(false);
+    setRemaining(THEME_SWITCH_COOLDOWN_MS);
+  }
 
   return (
     <div style={{ position: 'relative' }} onClick={(e) => e.stopPropagation()}>
@@ -228,7 +210,7 @@ function ThemeSwitcherButton({ fen }) {
           {Object.entries(THEMES).map(([key, theme]) => (
             <button
               key={key}
-              onClick={() => (key === activeTheme ? setOpen(false) : switchThemeMidGame(key, fen))}
+              onClick={() => pick(key)}
               className={`hud-theme-button${key === activeTheme ? ' active' : ''}`}
               style={{
                 fontFamily: 'var(--font-ui), system-ui, sans-serif',
@@ -287,6 +269,181 @@ function ControlHint() {
 }
 
 /*
+ * Fog-of-war onboarding — the mechanic this whole game is built around is
+ * genuinely non-standard (a chess player has never had to reason about
+ * "which squares can I currently see") and nothing in the HUD explained it
+ * before this: a first-time player's own pieces would vanish into fog, or
+ * get captured by something that was never on screen, with no framing for
+ * why. Minesweeper's own "here's what a flag/number means" blurb is the
+ * model — a couple of short explanations up front, not a tutorial that has
+ * to be clicked through before playing.
+ *
+ * Centred, on a scrim, same pattern as PromotionModal.jsx: a click anywhere
+ * on the scrim dismisses (stopPropagation on the card group itself keeps a
+ * click ON the cards from bubbling to it), and there's also an explicit
+ * "Got it" button for a deliberate confirm rather than an accidental
+ * click-through. Both read as the same action — dismiss — so both just call
+ * the same handler.
+ *
+ * `localStorage`, not `sessionStorage` (contrast `INTRO_SEEN_KEY`, which is
+ * deliberately per-tab-session): this is "have you ever been told the rule,"
+ * not "did you see the intro this session" — a returning player a week later
+ * doesn't need it re-explained every session the way the intro cinematic is
+ * fine to repeat.
+ */
+const FOG_ONBOARDING_SEEN_KEY = 'dead-reckoning:fog-onboarding-seen';
+
+const FOG_ONBOARDING_CARDS = [
+  {
+    id: 'vision',
+    icon: '🌫️',
+    title: 'Fog of war',
+    body: 'You only see squares your own pieces currently control. Everything else on the board is hidden.',
+  },
+  {
+    id: 'ambush',
+    icon: '⚔️',
+    title: 'Hidden danger',
+    body: "An enemy piece you've never seen can still capture you from inside the fog — losing a piece to \"nowhere\" is expected, not a bug.",
+  },
+];
+
+function hasSeenFogOnboarding() {
+  try {
+    return window.localStorage.getItem(FOG_ONBOARDING_SEEN_KEY) === '1';
+  } catch {
+    // Storage disabled/unavailable (private mode, etc.) — treat every visit
+    // as first-time rather than throwing; worst case the cards reappear.
+    return false;
+  }
+}
+
+function markFogOnboardingSeen() {
+  try {
+    window.localStorage.setItem(FOG_ONBOARDING_SEEN_KEY, '1');
+  } catch {
+    // Non-fatal — the cards would just show again next visit.
+  }
+}
+
+function FogOnboardingCard({ card }) {
+  return (
+    <div
+      role="note"
+      style={{
+        display: 'flex',
+        gap: 12,
+        alignItems: 'flex-start',
+        padding: '14px 16px',
+        borderRadius: 10,
+        background: 'rgba(237, 231, 217, 0.97)',
+        border: '1px solid #D6CDBA',
+        boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
+        fontFamily: 'var(--font-ui), system-ui, sans-serif',
+      }}
+    >
+      <span aria-hidden="true" style={{ fontSize: 20, lineHeight: 1.3 }}>
+        {card.icon}
+      </span>
+      <div>
+        <div
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            color: 'var(--ember)',
+            marginBottom: 4,
+          }}
+        >
+          {card.title}
+        </div>
+        <div style={{ fontSize: 13, lineHeight: 1.45, color: 'var(--lacquer)' }}>{card.body}</div>
+      </div>
+    </div>
+  );
+}
+
+function FogOnboarding() {
+  // Lazy init so a returning player (localStorage already set) never even
+  // mounts the dialog for one frame before disappearing.
+  const [dismissed, setDismissed] = useState(hasSeenFogOnboarding);
+
+  function dismiss() {
+    if (dismissed) return;
+    setDismissed(true);
+    markFogOnboardingSeen();
+  }
+
+  useEffect(() => {
+    if (dismissed) return undefined;
+    const onKey = (event) => {
+      if (event.key === 'Escape') dismiss();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dismissed]);
+
+  if (dismissed) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Fog of war rules"
+      // A click anywhere on the scrim (i.e. not on the cards themselves,
+      // which stop it below) dismisses — same convention PromotionModal.jsx
+      // already uses for "click past it costs nothing."
+      onClick={dismiss}
+      style={{
+        position: 'absolute',
+        inset: 0,
+        zIndex: 25,
+        display: 'grid',
+        placeItems: 'center',
+        background: 'rgba(20, 18, 15, 0.35)',
+      }}
+    >
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+          maxWidth: 380,
+          padding: '0 16px',
+        }}
+      >
+        {FOG_ONBOARDING_CARDS.map((card) => (
+          <FogOnboardingCard key={card.id} card={card} />
+        ))}
+        <button
+          onClick={dismiss}
+          style={{
+            alignSelf: 'center',
+            marginTop: 4,
+            padding: '8px 28px',
+            fontFamily: 'var(--font-ui), system-ui, sans-serif',
+            fontSize: 12,
+            fontWeight: 600,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            color: '#F4F1EA',
+            background: 'var(--ember)',
+            border: 'none',
+            borderRadius: 6,
+            cursor: 'pointer',
+          }}
+        >
+          Got it
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/*
  * Крок 11, Section A: this environment's headless browser renders at ~1fps
  * regardless of scene complexity (see CLAUDE.md's "Headless browser"
  * section) — real GPU frame rate can only be checked in an actual browser.
@@ -323,7 +480,15 @@ function FpsCounter() {
   return <>{fps} fps</>;
 }
 
-export default function HUD({ turn, status, visibleCount, onNewGame, showGameplay = true, fen }) {
+export default function HUD({
+  turn,
+  status,
+  visibleCount,
+  onNewGame,
+  showGameplay = true,
+  themeKey,
+  onThemeChange,
+}) {
   const showDebug =
     SHOW_DEBUG ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug'));
@@ -380,11 +545,12 @@ export default function HUD({ turn, status, visibleCount, onNewGame, showGamepla
               actually ends — that screen has its own "Change Theme", which
               resets to a new game on purpose, a different action from this
               one. */}
-          {showGameplay && <ThemeSwitcherButton fen={fen} />}
+          {showGameplay && <ThemeSwitcherButton activeTheme={themeKey} onThemeChange={onThemeChange} />}
         </div>
       )}
 
       {showGameplay && <ControlHint />}
+      {showGameplay && <FogOnboarding />}
 
       {showGameplay && (
         <>

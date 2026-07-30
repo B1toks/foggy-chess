@@ -1,20 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
 import { squareToWorld } from '../lib/coords';
 import { ALL_SQUARES, HIGHLIGHT_HEIGHT } from '../lib/fog';
-import { THEMES, themeKeyFromUrl } from '../lib/themes';
+import { THEMES, DEFAULT_THEME, themeKeyFromUrl } from '../lib/themes';
 import { getBoardRoughnessMap } from './proceduralTextures';
 import { sfx } from './audio';
 
-// Крок 13: read once at module load, same convention PieceModel.jsx and
-// RockIsland.jsx use.
-const ACTIVE_THEME = THEMES[themeKeyFromUrl()];
+// Крок 19: was a frozen ACTIVE_THEME read once at module load — see git
+// history. Live mid-game theme switching needs LIGHT/DARK/HIGHLIGHT to react
+// to a changing `themeKey` prop instead, so this now only supplies the
+// default for callers that don't pass one.
+const INITIAL_THEME_KEY = themeKeyFromUrl();
 
 // The light/dark split has to be obvious at a glance — a chessboard should
 // read as a chessboard instantly. The previous pair (#EDE7D9 / #D6CDBA) was
 // nearly the same value and left the board looking unfinished.
-const LIGHT = ACTIVE_THEME.board.light;
-const DARK = ACTIVE_THEME.board.dark;
-const HIGHLIGHT = ACTIVE_THEME.accent;
 const GRID = '#2B2018';
 // Near-black frame: the darkest mass in the composition, and what anchors the
 // whole light-key scene.
@@ -40,7 +39,12 @@ export default function Board({
   onSelectedChange,
   onHoveredChange,
   onPendingPromotionChange,
+  themeKey = INITIAL_THEME_KEY,
 }) {
+  const { LIGHT, DARK, HIGHLIGHT } = useMemo(() => {
+    const theme = THEMES[themeKey] ?? THEMES[DEFAULT_THEME];
+    return { LIGHT: theme.board.light, DARK: theme.board.dark, HIGHLIGHT: theme.accent };
+  }, [themeKey]);
   const [selected, setSelected] = useState(null);
   const [targets, setTargets] = useState([]);
   // A promoting move the player has aimed but not yet completed: the pawn stays

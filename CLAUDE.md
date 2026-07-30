@@ -818,6 +818,110 @@ as a starting point, not deleted — re-enabling any one of them later is a
 one-line `mode: 'image' -> 'splat'` change, same as before this pass, should
 a real-device perf budget ever justify it.
 
+## Крок 19: theme is a live prop now, not a frozen module constant
+
+Reported as "switching themes mid-game freezes the page — needs a manual
+refresh." The mechanism (HUD.jsx's mid-game switcher, `IntroOverlay.jsx`'s
+own picker) was always `window.location.href = url` — a genuine full browser
+navigation, not a bug in the navigation call itself. Every themed module
+(`lib/fog.js`, `PieceModel.jsx`, `RockIsland.jsx`, `Board.jsx`,
+`Backdrop.jsx`) read `themeKeyFromUrl()` exactly once, at its own module
+load, into a frozen constant — a `pushState`/`replaceState`-only change
+could never have reached any of them, so a real reload was the only way a
+picked theme actually took effect. That architecture is what Крок 13/16's
+own comments already flagged as deliberate: "a real page navigation... not a
+React state change... converting every module into a reactive read is a
+real architectural change, not this task." This pass is that change.
+
+**`themeKey` now lives in `GameCanvas.jsx` as plain `useState`, threaded down
+as a prop exactly the way `selectedSquare`/`hoveredSquare`/
+`pendingPromotion` already are** — not React Context, deliberately: r3f
+mounts `<Canvas>`'s children through a second, separate reconciler root, and
+plain React Context does not cross that boundary unless re-provided inside
+it. Prop drilling through `GameCanvas` (which already sits above both the
+DOM/HUD tree and the `<Canvas>` tree) sidesteps the question entirely and
+matches this codebase's own established convention for exactly this kind of
+cross-cutting state.
+
+**Every module that used to freeze `ACTIVE_THEME`/`ACTIVE_THEME_KEY` at
+import time now derives the same values from a `themeKey` prop, memoized
+with `useMemo`/`useEffect` instead of computed once:**
+
+- `lib/fog.js` exports a new `fogColorsForTheme(themeKey)` alongside the old
+  frozen `FOG_COLOR`/`FOG_TINT_COLOR`/`FOG_SHADOW_COLOR`/`FOG_LIT_COLOR` —
+  the frozen ones are kept only for `FogLayer.jsx` (tier 1, the documented
+  non-live rollback); `FogShader.jsx` (tier 2, the active implementation)
+  calls the function instead. The fog's three colour uniforms
+  (`uColorShadow`/`uColorLit`/`uTint`) are genuinely cheap to update in
+  place — no shader recompile, no material recreation — so a theme switch
+  just calls `.set()` on each in a `useEffect` keyed on `themeKey`.
+- `PieceModel.jsx` takes `themeKey` as a prop (threaded through
+  `Pieces.jsx`'s `AnimatedPieceGroup`/`CaptureGhost`). `pieceModelPath
+  (themeKey, type)` changing is what actually swaps the geometry — `useGLTF`
+  is keyed by URL in drei's own loader cache and already suspends/resolves
+  through React Suspense, which is exactly the reactive path a changing URL
+  prop needs, no different in kind from the very first mount. The shared
+  `BONE` material singleton (every white piece points at the same object) is
+  recoloured in place via `syncBoneColorToTheme(themeKey)`, called from a
+  `useEffect` in every mounted `PieceModel` — redundant across up to 32
+  pieces, but the assignment itself is a trivial `THREE.Color.set`, not
+  worth hoisting to one shared call site for this.
+- `RockIsland.jsx`'s `deriveRockConfig(themeKey)` replaces five frozen
+  constants (`ROCK_FIT_HALF_WIDTH`, `ROCK_SCALE_XZ`, `ROCK_SCALE_Y`,
+  `ROCK_Y_OFFSET`, plus the emissive/tint pair) with one function indexing
+  the *same* per-theme lookup tables (`ROCK_FIT`, `ROCK_ALBEDO_MEAN_LUMA`,
+  `ROCK_THEME_EMISSIVE_FLOOR`) that already existed keyed by theme — this is
+  a mechanical "look the value up with a variable key instead of a frozen
+  one" change, not a re-derivation of any of the fit/tint numbers themselves.
+- `Board.jsx`'s LIGHT/DARK/HIGHLIGHT colours are computed in a `useMemo`
+  keyed on `themeKey` instead of at module load.
+- `Backdrop.jsx`'s `USES_PAINTING`/`USES_THEME_SPLAT`/segment array are all
+  now derived via `deriveBackdropConfig(themeKey)`/`backdropSegmentsFor(...)`
+  inside the component, memoized on `themeKey`. The image-readiness probe
+  (`imagesReady`) resets to `false` and re-probes whenever the theme's own
+  segments change, so a switch shows the fast `Mountains` fallback for the
+  brief window before the new theme's painting is confirmed loaded, rather
+  than either flashing the previous theme's painting or skipping the
+  fallback window entirely.
+
+**Verified this is a genuine live switch, not just "the freeze went away,"**
+using the same kind of internal-state read this codebase already relies on
+for the fog wave system (see "QA hooks"): `window.__fogWave.current.clock`
+was read immediately before and after a live switch and found to have kept
+increasing continuously across it (3.05s -> 7.36s in one run) — a real page
+reload, or even a React-level remount of the fog tree, would have reset that
+clock to ~0. Also confirmed via Playwright's own `framenavigated` event and
+`window.__phase`: a `history.replaceState` call (the URL-sync side effect,
+kept purely so the page stays bookmarkable at its current theme) does fire a
+same-document `framenavigated` event, but `window.__phase` never became
+`undefined` at any point — the tell a real full-page reload would leave,
+since that destroys and recreates the whole JS context. Checked against both
+directions (mist -> ocean, ocean -> snow) and against a `next build`
+production bundle, not just `next dev`.
+
+The mid-game switcher's cooldown (`HUD.jsx`) dropped from 10s to 2s and from
+`sessionStorage`-backed to plain component state — the old duration and
+persistence-across-reload existed specifically to survive the *reload the
+switch itself used to trigger*, which no longer happens; the cooldown that's
+left only exists to stop rapid re-clicking from queueing overlapping
+GLTF/texture loads for several themes at once.
+
+## Крок 19: fog-of-war onboarding
+
+First-time players had no in-game explanation for why pieces disappear or
+get captured by something never seen on screen — `HUD.jsx`'s new
+`FogOnboarding` shows two short, dismissible cards (top-right, matching the
+existing corner-panel visual language) the first time `showGameplay` becomes
+true: one on the vision rule ("you only see squares your own pieces
+control"), one on the ambush rule ("a hidden enemy can still capture you").
+Persisted via `localStorage` (`dead-reckoning:fog-onboarding-seen`), not
+`sessionStorage` like `INTRO_SEEN_KEY` — this is "has this player ever been
+told the rule," which shouldn't re-fire every session the way the intro
+cinematic is fine to repeat. Marked seen only once BOTH cards are gone
+(dismissed individually or auto-faded together after 16s), not per-card, so
+a reload mid-read (a theme switch, an accidental refresh) can't mark it
+"seen" after only the first card ever rendered.
+
 ## Architecture
 
 ```
@@ -1522,6 +1626,531 @@ fogged — never a uniform grey wash. `tools/fogdiag.mjs`'s occlusion numbers
 are unchanged (see the Крок 14 entry just above), confirming this doesn't
 touch the occlusion guarantee, only the starting point of what eases into it.
 
+## Крок 20: Ocean's splat re-enabled — and a Mint export format that doesn't work here
+
+A fresh Mint export of "Ink Wash Sea Canyon" arrived as
+`public/ink-wash-sea-canyon-71b2169540978d28-lod.rad` — **not usable**.
+Its header is a custom container (`RAD0` magic + a JSON manifest declaring
+`"type": "gsplat", "lodTree": true, "chunkSize": 65536`, followed by chunked
+binary data), not any of the formats Spark 0.1.10 actually parses (`.spz`,
+`.ply`, `.splat`, `.ksplat` — confirmed by grepping the installed package's
+own dist bundle, not assumed from its docs). It's Mint's own LOD/streaming
+container; there is no public decoder for it. Left in `public/` untracked
+rather than deleted — it costs nothing until `git add`, and Mint may add
+`.spz` export for LOD packs later.
+
+**A standard-format export of the same capture was already sitting in the
+repo, unused**: `public/ink-wash-sea-canyon-4b924cffda141b26.spz` (Крок 13),
+already wired into `lib/themes.js`'s `ocean.backdrop.splatUrl` with a starting
+`splat` transform carried over from Snow's own corrected placement — flagged
+at the time as "never independently checked against this specific capture."
+This pass flipped `ocean.backdrop.mode` from `'image'` to `'splat'` (the only
+change `lib/themes.js` needed at first — `Backdrop.jsx`'s `usesThemeSplat`
+branch was already theme-generic, unchanged since Крок 16 Section B).
+
+**First attempt at verifying the carried-over rotation was wrong, and here's
+why the method itself was the problem.** A `?sprotX=` sweep (the same method
+that diagnosed Snow's upside-down splat) was screenshotted in this headless
+environment and `-90` (the existing value, copied from Snow) was read as "a
+coherent canyon." It wasn't — the very next real-hardware test (a live user
+report: 100% CPU while the splat loads, 90% GPU once it renders, FPS down to
+30, **and** "the scene is still perpendicular to the board") showed the
+capture standing up as a wall, exactly the "wall standing next to the island"
+failure Mist's own capture hit for the identical reason (see Mist's own
+`backdrop` comment) — copying Snow's Z-up correction onto a capture that was
+actually already Y-up. This headless environment's software rasteriser
+renders busy ink-wash splat noise chaotically enough that a genuinely broken
+orientation and a genuinely correct one were **not visually distinguishable
+in a screenshot** here. Don't trust an orientation call made from a
+screenshot taken in this environment again — verify from the data instead
+(next paragraph), and treat any headless "looks fine" on a splat as
+provisional until a real device confirms it.
+
+**The fix: decode the raw point positions and measure the up-axis directly,
+instead of eyeballing a render.** `tools/probe-splat-axes.mjs` gunzips a
+`.spz` and parses its header + centers exactly the way `@sparkjsdev/spark`'s
+own `SpzReader` does (confirmed by reading `dist/spark.module.js` directly,
+not assumed) — magic `1347635022`, version 3, 24-bit fixed-point per axis at
+`fractionalBits` from the header. A plain min/max or std-dev per axis came
+back too close to call (X/Y/Z std within 8% of each other — some far-flung
+clutter splats were skewing it). Switching to **p01-p99 percentile extent**
+(the same method CLAUDE.md's own mountain-valley derivation already used, see
+the Gaussian splat backdrop section above) gave a clean answer: local Y
+range 14.46 vs X 25.08 / Z 26.23 — Y is unambiguously the capture's own "up."
+So the correct rotation is `[0, 0, 0]` (identity — same as Mist's own
+capture), not `[-90, 0, 0]`. Re-verified visually after the fix, still inside
+this environment's known limitation: the corrected orientation shows a
+distinct ground band below a differently-toned band above (sky/far cliff),
+where the wrong orientation showed one uniform texture filling the whole
+frame top-to-bottom with no horizon — a coarser signal than "does this look
+like a canyon," and one this environment's rasteriser can actually carry.
+
+**The CPU/GPU cost report is real and Крок 16 Section B's existing levers
+don't touch it, because they run too late.** `downsampleSplats`
+(`SplatBackdrop.jsx`) only executes inside Spark's `constructSplats` hook,
+called *after* the full file is fetched and decoded into a `PackedSplats` —
+its own comment already said as much ("the full file still has to be
+downloaded and decoded... there is no way around that without a second,
+pre-shrunk .spz asset"), which is exactly what the 100%-CPU-while-loading
+report is: decode cost scales with the source file's splat count, not with
+whatever fraction gets kept afterward. `tools/shrink-spz.mjs` is the fix —
+an offline, one-time tool, not a runtime cost. SPZ is a structure-of-arrays
+format (all centers, then all alphas, then all rgb/scale/quaternion, never
+interleaved per splat — confirmed the same way, from `SpzReader`/`SpzWriter`'s
+own source), so downsampling is a pure byte-copy at a fixed stride: no value
+is ever decoded or re-encoded, so the splats that survive have **zero**
+precision loss versus the original file, only fewer of them. Verified by
+running `tools/probe-splat-axes.mjs` against the shrunk output too — p01/p50/
+p99 per axis matched the source file to two decimal places, confirming the
+distribution wasn't corrupted, just thinned.
+
+`public/ink-wash-sea-canyon-shrunk.spz` (kept untracked, like the source
+`.rad`, pending the user's own call on committing it): **1,920,000 -> 288,000
+splats (15%), 32.5 MB -> 4.9 MB**. Крок 16 Section B's client-side
+`SPLAT_KEEP_FRACTION` (0.35) still applies on top after load — verified via
+`window.__splat`: `{state: 'ready', count: 100800}`, i.e. 288,000 * 0.35 —
+so the two levers compound to **100,800 splats actually resident on the GPU,
+5.25% of the original 1.92M**, and the network payload alone is down 85%.
+Decode cost (the CPU-bound part of the original report) scales with the
+288,000 the browser now actually parses, not the original 1.92M — an
+~6.7x cut there specifically, independent of whatever the GPU-side levers
+already did.
+
+**What this still does NOT establish: that Ocean's splat is now cheap enough
+for this project's real target hardware.** Крок 17/18 reverted splats for all
+three themes on an *identical* real-device signal (20fps, 90% VRAM) before
+any of Крок 16 Section B's levers or this shrink existed, and this headless
+environment provably cannot be trusted to make that call on its own (see two
+paragraphs up) — a single splat frame here still costs 100+ seconds
+regardless of viewport size, dominated by CPU/WASM sort time, not GPU raster,
+so it can't stand in for a real FPS/VRAM reading either. The right next step
+is the same real-device test that surfaced the original problem: check
+`FpsCounter` (`?debug=1`) and real GPU/CPU load with this build. If the
+~19x-fewer-splats-resident, ~85%-smaller-download version still isn't enough,
+the lever to pull next is a lower `?spkeep=`/shrink ratio, and if that still
+isn't enough, `ocean.backdrop.mode` back to `'image'` is still a one-line
+revert onto a floor that was already proven fast (Крок 17/18's own
+conclusion) — don't chase a fourth splat placement past the point real
+hardware says no.
+
+## Крок 21: splat reduction is importance-ranked now, and splat quality is measurable offline
+
+Reported as "uniform random point removal destroys visual coherence at high
+compression ratios." Correct, and the fix is not a better random.
+
+**The enabling change is `tools/splat-raster.mjs`: a CPU EWA splat rasterizer
+in Node.** Every previous splat pass in this file hit the same wall — "real
+placement tuning needs a real GPU", "do not try to place this from a headless
+screenshot", "this environment cannot verify a 4-second budget", and Крок 20's
+own hard lesson that a correctly-oriented capture and a broken one were *not
+visually distinguishable* in a screenshot here. All of those limits are about
+the **browser**. Rendering the splats on the CPU instead — standard 3DGS/EWA
+projection, analytic 2D covariance, front-to-back compositing, ~1.5s a frame
+against the browser's 100+ — turns "does this look right" into a number. It
+models Spark's own `minAlpha`/`minPixelRadius`/`maxStdDev` so what it measures
+is what the app draws, and it counts fragment evaluations so GPU cost can be
+traded against quality. **This is the tool to reach for before any future splat
+question, ahead of a screenshot.**
+
+### Why the old stride was losing almost everything
+
+`tools/analyze-spz.mjs` on the sea-canyon capture: the top **15% of splats by
+contribution carry 92.7% of the rendered image**. A 15% stride keeps 15% of it.
+Also 9.3% of splats sit below Spark's own `minAlpha` and 94.8% project
+sub-pixel — the file is mostly splats that cannot paint anything.
+
+The second failure is the one that actually produces the reported symptom. A
+3DGS surface is opaque only because many Gaussians *overlap*. Remove 85% of
+them uniformly and the surface stops being opaque: the capture goes
+transparent and speckled rather than soft. **The artifact is missing opacity,
+not missing detail** — which is why no amount of blurring or dithering fixes
+it, and why "a bit soft is an acceptable price" (Крок 17's framing) was never
+the trade actually on offer.
+
+### What replaced it
+
+`tools/shrink-spz.mjs`, three mechanisms, each measured:
+
+1. **Importance ranking** (LightGaussian, arxiv 2311.17245 — scores a Gaussian
+   by rays-that-hit-it x opacity x volume). The hit-count term is projected
+   area, so the view-independent form is `opacity * s_largest * s_second` —
+   the two largest axes, because 3DGS fits surfaces with flattened disc-shaped
+   Gaussians and the third axis is disc thickness. `--theme=<key>` additionally
+   weights by real projected pixel area over this project's own reachable
+   camera clamps, but that makes the asset **placement-locked**, so it is opt-in.
+2. **Spatial stratification** (Mini-Splatting, arxiv 2403.14166). Pure global
+   ranking would empty a whole low-contrast region to fund one high-contrast
+   ridge. A voxel grid guarantees **at least one survivor per occupied cell**.
+3. **Coverage compensation.** Survivors grow by `sqrt(areaBefore/areaKept)` per
+   cell to restore lost overlap, capped by `--maxgain`.
+
+Three things here were wrong on the first attempt and are worth not
+re-deriving:
+
+- **A large per-cell floor is harmful.** The min-one-per-cell rule is the whole
+  coverage guarantee; an *extra* `--floor` on top spends budget forcing 25% of
+  every cell of junk splats. Measured 35.9 -> 27.5 dB at fixed budget going
+  from floor 0 to 0.15. Default is now **0**.
+- **The voxel grid must be calibrated to the budget, not hardcoded.** Occupied
+  cells are a floor on the output count, so too fine a grid makes every cell
+  keep exactly its one splat and the importance ranking has no budget left to
+  express itself. At 256 cells the grid had 337,577 occupied cells against a
+  261,215 budget: output overshot to 337,577 splats **and** quality dropped to
+  32.9 dB, worse than the 192-cell grid's 35.1 dB with 29% fewer splats. The
+  grid is now binary-searched to put occupied cells at `--occupancy` (0.65) of
+  the budget; measured flat between 0.4 and 0.85.
+- **Compensation is worth only +0.24 dB, and that is the proof the diagnosis
+  was right.** Importance ranking keeps the big splats, so it retains the area
+  for free and has almost nothing to put back. A stride retains area in
+  proportion to count and would need a 2.6x gain at 15%.
+
+### The numbers
+
+`tools/splat-compare.mjs`, full 1.92M cloud as ground truth, matched counts:
+
+| kept | count | stride PSNR | importance PSNR | gain |
+|---|---|---|---|---|
+| 4.5% | 87,071 | 12.10 dB | **28.38 dB** | +16.3 |
+| 9.1% | 174,143 | 14.12 dB | **32.86 dB** | +18.7 |
+| 13.6% | 261,215 | 15.49 dB | **35.87 dB** | +20.4 |
+| 22.7% | 435,359 | 17.59 dB | **40.05 dB** | +22.5 |
+
+**The new method at 87k splats beats the old at 435k** — 5x fewer, better
+looking. Against what actually shipped (288k stride file, then client-strided
+to 35% = 100,800 resident), at the identical 100,800:
+
+| | PSNR | mean luma error | download |
+|---|---|---|---|
+| shipped before | 12.94 dB | 37.5 / 255 | 4.88 MB |
+| importance | **29.55 dB** | **4.0 / 255** | 1.76 MB |
+
+**One honest caveat, do not lose it: importance selection keeps the LARGE
+splats, so at matched count it costs ~2.9x the fragment/overdraw work**
+(7.11M vs 2.47M evaluations per frame). Splat count is not the GPU cost here;
+covered area is. The equal-GPU-cost operating point is roughly 40-60k splats
+with `--maxgain=1.0` and `maxStdDev` sqrt(3), which still lands +8 to +11 dB
+over what shipped while using 40-60% fewer splats. Shipping 60,000
+(`public/ink-wash-sea-canyon-opt.spz`, **1.05 MB**, down from 4.88 MB and from
+32.5 MB raw).
+
+### The Spark levers, finally measured (`tools/spark-levers.mjs`)
+
+| setting | PSNR | drawn | fragments |
+|---|---|---|---|
+| `minAlpha` 0.02 | inf | 100.0% | 100.0% |
+| `minPixelRadius` 1.0 | inf | 100.0% | 100.0% |
+| `maxStdDev` sqrt(5) | 37.8 dB | 99.9% | 69.5% |
+| `maxStdDev` sqrt(3) | 28.5 dB | 99.8% | 47.5% |
+
+**`minAlpha` and `minPixelRadius` are now completely inert** — the offline
+pruner already removed everything they would have culled, so Крок 16 Section
+B's writeup of them as the perf story no longer holds (they culled 9.3% and
+94.8% of the *raw* file; they are kept only as a guard for an unpruned
+capture). `maxStdDev` is the only lever that does anything and it moves
+fragment cost, which is the cost that matters. Lowered to **sqrt(3)**: 32% less
+fragment work for 1.6 dB on a backdrop sitting behind fog. `?spstddev=`
+overrides it live.
+
+**`SPLAT_KEEP_FRACTION` in `SplatBackdrop.jsx` is now 1.0 and must stay there
+for a pre-pruned asset.** Striding an importance-selected cloud discards the
+chosen splats at the same rate as any others and puts the speckle straight
+back — the two policies do not compose. `?spkeep=` survives as a runtime
+emergency lever only; the real fix for "still too heavy" is a smaller
+`--count` when regenerating.
+
+### Ocean's placement is broken, and that is a bigger cost than any of the above
+
+Found while building the measurement, not looked for. `tools/place-splat.mjs`
+scores placements over the reachable orbit — nearest in-frame splat, frame
+coverage, and luma std dev ("detail", the number that separates a real vista
+from a uniform wall, which is exactly what a screenshot here cannot resolve):
+
+| placement | nearest splat | coverage | detail | fragments/frame |
+|---|---|---|---|---|
+| **shipped ocean** (s12, [0,0,0]) | 14.7 | 0.93 | 0.045 | **36.0M** |
+| mist-style (s3, [-48,-5.9,36]) | 17.8 | 0.71 | 0.046 | 21.3M |
+| landmass (s3, [-48,-12,36]) | 17.9 | 0.83 | **0.064** | 23.1M |
+| surround (s12, y-40) | 51.7 | 0.95 | 0.056 | 42.2M |
+
+At the shipped transform the capture is scaled 12x around the board's own
+origin, so the camera sits **inside** it: a CPU render of the full cloud there
+is a literally flat teal wall (`tools/shots/place-shipped-ocean--v0.png`),
+coverage 0.93-1.0, and **~880 fragment evaluations per pixel**. That is the
+90%-GPU report's actual source — overdraw from a capture at point-blank range,
+not point count. It is also the same "camera buried inside a hillside" failure
+this file already records for mist at scales 12, 2 and 1.
+
+The capture is a roughly circular *island* ~25 local units across, not a
+panoramic surround, so it can only ever read as a landmass at backdrop
+distance — which is what mist's own placement already does. **This was not
+changed**, because which placement looks right is an art-direction call and
+Крок 17/18 already reverted splats once on a real-device signal. But the
+placement scan is now a 2-minute offline command instead of impossible, so the
+next attempt should start there rather than from `?sp*=` sweeps in a browser.
+
+### What was verified in the browser, and the trap that made it look broken
+
+Verified end-to-end against a production `next build`: `window.__splat` reaches
+`{state: 'ready', count: 60000}` with no console/page errors, and the live
+`SparkRenderer` reads back `minAlpha 0.02, minPixelRadius 1, maxStdDev 1.7321`
+— i.e. the new asset loads at exactly the count the tool produced (proving no
+client-side stride ran on top of it) and the levers are actually applied. The
+file was independently validated by parsing it with **Spark's own `SpzReader`**:
+60,000 splats, zero invalid centers/scales/quaternions, mean scale 5.2x the
+source's (it kept the big splats, as designed).
+
+**Two environment traps cost real time here; don't repeat them.** A headless
+run will report `window.__splat` as `null` or stuck at `'loading'` forever, and
+neither means the splat is broken:
+
+1. **`isLowPowerDevice()` in `Backdrop.jsx` is `(max-width: 768px), (pointer:
+   coarse)`, and a splat NEVER mounts on a match** (Крок 17). A 400x300 or
+   480x320 headless viewport silently skips the splat entirely and
+   `window.__splat` stays `null`. Use a viewport wider than 768px.
+2. **`SPLAT_LOAD_BUDGET_MS` is 4000**, and nothing loads that fast in this
+   environment, so `ThemedSplatBackdrop` always unmounts before ready — which is
+   why an earlier attempt saw `'loading'` and then nothing. Raise it temporarily
+   to verify a splat in a headless run, and put it back.
+
+Load time is **not** differentiated by this test: old (4.88 MB) and new (1.05 MB)
+both reached ready in 8s over localhost, where there is no bandwidth
+constraint. The 4.6x download cut is real but only shows on a real network —
+and it is what makes the 4-second budget above plausible at all, which 32.5 MB
+never was.
+
+Real fps/VRAM remains unmeasured here, as everywhere else in this file. Check
+`?debug=1`'s `FpsCounter` on real hardware; `?spstddev=` and `?spkeep=` tune it
+without a rebuild, and `ocean.backdrop.mode` back to `'image'` remains the
+one-line revert onto a floor already proven fast.
+
+### Snow: enabled, decluttered, and its placement solved rather than inherited
+
+Snow was still on `mode: 'image'` from Крок 17, so none of the above was
+visible in the theme this project's own notes called the successfully-placed
+one. Turning it on surfaced two things.
+
+**"Snow's splat WAS successfully placed (Крок 16 Section B)" does not survive
+measurement.** At its old transform (scale 12 at the origin)
+`tools/place-splat.mjs` scores the nearest in-frame splat at **2.1 world
+units** — inside the board, half-width 4.3 — coverage 0.998, and **~3,690
+fragment evaluations per pixel**, four times worse than ocean's already-bad
+880. That is where the 20fps/90%-VRAM report came from. It had been judged
+from two screenshots, in the environment this file now documents as unable to
+tell a good splat placement from a broken one.
+
+The replacement transform is **solved, not swept**: the body centroid is put
+at world `[4, -32, 60]`, inside the elevation band the resting camera actually
+frames — it pitches 37.3 degrees down, so at that distance the visible band is
+world y `-10.5 .. -25.3`, the same derivation `Backdrop.jsx`'s own `TOP_Y`
+already uses for the painting. Measured: nearest splat 2.1 -> 32.0, fragments
+per frame **151M -> 5.4M (28x less overdraw)**. `rotX -90` is kept and is
+independently confirmed by `tools/probe-splat-axes.mjs` (p01-p99 spread 86.6
+on Z vs 104.1/118.5 on Y/X — this capture really is Z-up, unlike mist's).
+
+**`--declutter` is new, and it is the one place PSNR-to-original is the wrong
+metric.** Every Mint capture here carries a tail of detached splats flung
+clear of the body (the isolated blobs in `tools/shots/wide-*.png`). Importance
+ranking makes them *worse*, not better, which is not obvious: clutter splats
+are large and opaque, exactly what the score rewards, so they survive
+preferentially while real surface detail is culled around them — and a single
+stray speck is what sets the "nearest splat" distance and reads as dirt
+floating over the board. `--declutter=N` drops splats whose voxel cell holds
+fewer than N others, i.e. it tests local density rather than distance from a
+centroid, so a far-but-solid ridge survives and a nearby speck does not.
+
+Measured on snow at 60,000 splats, against the full cloud:
+
+| | PSNR | fragments | reads as |
+|---|---|---|---|
+| stride | 22.20 dB | 1.16M | speckle |
+| importance, no declutter | **34.47 dB** | 13.7M | featureless white blob |
+| importance, `--declutter=100` | 19.52 dB | **5.4M** | snowy ridge with real structure |
+
+The importance-vs-stride result is the same +12.3 dB as ocean's. But declutter
+*lowers* PSNR monotonically, and that is correct and expected: it deliberately
+removes content that exists in the original, so a fidelity-to-original metric
+can only punish it. The visual check decides it, and decides it clearly
+(`tools/shots/fin-*.png`) — the undecluttered file's own clutter blobs
+dominate the silhouette into an amorphous cloud, while the decluttered one
+shows the ridge. **Do not "fix" the declutter default by chasing the PSNR
+number**; it is measuring faithfulness to garbage. Ocean's shipped asset is
+built without declutter, snow's with `--declutter=100`.
+
+Both themes verified in the browser against a production build:
+`{state: 'ready', count: 60000}`, `maxStdDev 1.7321`, no console or page
+errors, snow in 10s and ocean in 8s.
+
+## Крок 22: Mist's splat, and what that capture actually is
+
+The third splat — `public/sumi-e-mountain-valley-6472fa791839e183.spz`, the
+one this file has recorded as "wired, not yet placed" since before the theme
+system existed — got Крок 21's pipeline and is **on** now, at a placement
+that is solved rather than swept. Ships as
+`public/sumi-e-mountain-valley-opt.spz`: **1,920,000 -> 60,000 splats, 33.26 MB
+-> 1.08 MB**, importance-ranked (26.43 dB / 4.31 luma MAE against the full
+cloud, where the old fixed-stride policy measures **16.94 dB / 17.10 MAE** at
+the identical count — the same ordering ocean and snow showed).
+
+**The structural finding, which is why three previous placement attempts
+failed: this capture is a panorama shot from the INSIDE.** Not a landmass.
+`tools/analyze-spz.mjs` plus an importance-weighted XZ mass map put its local
+radius at ~116 with **no open interior** — the nearest splat in the low
+elevation band is 0.1-1.5 local units at every candidate clearing centre
+tested. There is nowhere in it to stand. That is the whole content of this
+file's own "camera buried inside a hillside" / "close, muddy interior — no
+vista" history (scale 12, 2 and 1, then two more reasoned attempts in Крок
+18), and it is not a tuning gap: any placement that puts the camera inside
+this cloud is inside geometry.
+
+Two consequences worth not rediscovering:
+
+- **From outside, this capture is a soft pale ink-wash mass, not a ridge.**
+  Rendered wide with `tools/splat-raster.mjs` (`tools/shots/wide-mist-*.png`),
+  the full 1.92M cloud and the 60k pruned one look the same — so this is not a
+  pruning artifact. Its solid content is one small ridge and a couple of rock
+  clumps; everything else is diffuse haze.
+- **Therefore mist ships WITHOUT `--declutter`, unlike snow.** Declutter tests
+  local density, and here the haze *is* the backdrop: `--declutter=300` takes
+  rest-view frame coverage from 0.313 to 0.020 and leaves two small clumps
+  reading as floating debris. `--declutter=30` is the honest middle (drops
+  7.5%, coverage 0.313 -> 0.273, fragments -26%, PSNR 26.43 -> 20.07) and is
+  the lever to reach for if real-hardware fps ever demands it. Snow's
+  `--declutter=100` is right for snow's capture and wrong for this one; the
+  flag is per-capture, not a house style.
+
+### The placement, and the trap that nearly picked a placement of nothing
+
+`{ scale: 0.42, rotation: [0, -196.6, 0], position: [-22.8, -38.7, 55.5] }`.
+Every number is derived:
+
+- **`rotY -196.6`** swings the capture's own densest region (importance-weighted
+  centroid local `[10, 35, -98]`, azimuth 174.2 deg) round to the direction the
+  resting camera looks — which is the painted main segment's own azimuth,
+  `HOME_AZIMUTH - PI` = -22.4 deg. Rotation about Y only: `tools/probe-splat-
+  axes.mjs` re-confirms this capture is Y-up (p01-p99 spread 68.2 on Y vs
+  134.5 / 158.8 on Z / X), so snow's `rotX -90` correction stays off it.
+- **`position`** is 60 world units out along that azimuth, sunk so the ridge
+  tops (local y ~ +60) land 19 deg below horizontal from the resting camera at
+  y=7 — the same visible-band derivation `Backdrop.jsx`'s own `TOP_Y` uses for
+  the painting.
+- **`scale 0.42`** sets the range's height to 45% of its distance. Appearance
+  is **invariant under a rigid scale-and-push** (only `s/D` matters), so this
+  is one point on a line; the D=140 / scale 0.76 twin renders pixel-identically
+  and was scored to confirm it.
+
+**The trap: a placement can score well on `tools/place-splat.mjs` and be
+invisible in the game.** That tool's view ring is deliberately shallow-biased
+(the right bias for "is the camera buried"), and a shallow camera sees above
+the horizon. The resting camera does not — it pitches 37.3 deg down, so its
+frame *top* is already 16.3 deg below horizontal. A candidate at `posY 0`
+scored coverage 0.21 and 4.6M fragments on the ring, looking like the cheapest
+winner, and measured **rest-view coverage 0.000**: the entire capture sat above
+the resting frame. Score the resting camera explicitly before believing a ring
+number; the derivation above is what actually decides visibility.
+
+Measured with `tools/place-splat.mjs` (8 views, 224px) and a rest/shallow/behind
+render at 320x200, against snow's shipped placement as the reference this
+project already accepts:
+
+| placement | nearest splat | rest coverage | rest detail | rest Mfrag |
+|---|---|---|---|---|
+| **snow SHIPPED** (reference) | 35.6 | 0.418 | 0.108 | 5.5 |
+| ocean SHIPPED (the known-broken one) | 15.5 | — | 0.169 | — |
+| mist's old s3 transform | 28.6 | 0.743 | 0.173 | **31.6** |
+| sunk valley, camera inside the bowl | 20.5 | 0.817 | 0.091 | **25.3** |
+| **mist SHIPPED (this pass)** | **45.5** | **0.410** | **0.100** | **2.7** |
+
+So the shipped placement frames like snow's (coverage within 1%) at **half the
+fragment cost**, and both enclosing alternatives cost 9-12x it — the Ocean cost
+profile a real device already rejected at 20fps. Coverage 180 deg away is
+exactly **0.000**, so the painted segments still carry the rest of the orbit
+unaided; the splat is a one-sided horizon band, not a dome.
+
+### Verified in the browser, and the A/B that makes a headless check meaningful
+
+Against a production `next build`: `window.__splat` reaches `{state: 'ready',
+count: 60000}` in 11s over localhost, no console or page errors, and the live
+`SplatMesh` reads back `scale 0.42 / position [-22.8, -38.7, 55.5] / rotY
+-196.6` with `SparkRenderer` at `minAlpha 0.02, minPixelRadius 1, maxStdDev
+1.7321` — i.e. the transform and the levers are really applied and no
+client-side stride ran on top of the pruned asset.
+
+**The useful check here is not a screenshot, it is a screenshot diff.** Крок 20
+established that this environment cannot judge a splat by eye; but `?spopacity=0`
+turns the splat off without changing anything else, so shooting the same shallow
+camera twice and differencing the PNGs measures exactly which pixels the splat
+contributes. Result: **43,622 pixels, 4.3% of the frame, max channel delta 109**,
+concentrated in frame rows 20-60% from the top — the horizon band above and
+behind the rock, spread across most columns. Far less than the CPU raster's
+unoccluded 0.44 coverage, because in the real scene the rock, board, fog and
+painting sit in front of it; it reads as a horizon band rather than a wall,
+which is the intended backdrop role. Prefer this A/B over "does it look right"
+for any future splat question this environment is asked to answer.
+
+Real fps/VRAM is unmeasured here as always — `?debug=1`'s `FpsCounter` on real
+hardware is the check, `?spstddev=` / `?spkeep=` tune it without a rebuild, and
+`mist.backdrop.mode` back to `'image'` is the one-line revert onto a floor
+already proven fast.
+
+`tools/place-splat.mjs` gained `--candidates=list.json` so a scan against a
+capture the built-in list wasn't written for is reproducible instead of a
+throwaway edit to that array. `tools/splat-importance.mjs`'s `THEME_PLACEMENTS`
+was **stale** for mist and snow (it still held pre-Крок-21 transforms while
+claiming to mirror `lib/themes.js`); it is corrected, and it matters because
+`--theme=` weighting is placement-locked.
+
+## Крок 23: splats off, painted panoramas ship — this is the final state
+
+**All three themes are on `backdrop.mode: 'image'`.** Splat work is stopped;
+this is the shipping configuration, not another revert mid-investigation.
+
+The reasoning is the one this file already establishes and never resolved: the
+only real-hardware signal any splat placement ever produced was **20fps / 90%
+VRAM** (Крок 17/18), and every improvement since — Крок 21's importance-ranked
+pruning, Крок 22's solved placements — is measured **offline, by
+`tools/splat-raster.mjs`**, against PSNR and fragment counts. Those numbers are
+real and the pipeline is genuinely good, but not one of them is an fps or a
+VRAM reading on the target device, and this environment provably cannot produce
+one (see "Headless browser", and Крок 20's finding that a correctly-oriented
+capture and a broken one are not visually distinguishable in a screenshot
+here). The painted panorama is the only backdrop path with a real-device pass
+behind it, every theme has its own (Крок 18), and it costs 434 KB–1.6 MB
+against a splat's 1.05 MB plus per-frame sort and overdraw.
+
+Nothing was deleted. Every theme keeps its `splatUrl` and its measured `splat`
+transform, `SplatBackdrop.jsx` and all of `tools/`'s splat tooling are
+untouched, and `?sp*=` still works — **re-enabling any one theme is flipping
+that theme's own `mode` back to `'splat'`**, exactly as it was before this pass.
+If that ever happens, mist is the one to try first (Крок 22's placement: rest
+coverage matching snow's at half the fragment cost) and **ocean is the one to
+try last** — its shipped transform scales the capture 12x around the board's
+own origin, putting the camera inside it at ~880 fragment evaluations per pixel,
+which is a placement this file measured as broken and never fixed.
+
+Also removed: `THEMES.snow.backdrop.fallbackMode: 'procedural'`, dead since
+Крок 18 gave snow a real painting. Nothing ever read it — `Backdrop.jsx` keys
+off `image` + `mode` alone — and it read as "snow ships the procedural ridges",
+which was never true after Крок 18 and is definitely not true now.
+
+Verified: `npm test` 17/17, `next build` clean (5 static pages, 84.8 kB first
+load on `/`), and a production `npm start` serves `/`, `/?theme=ocean` and
+`/?theme=snow` at 200 with all three paintings fetching 200.
+
+**Two loose ends left deliberately, both flagged rather than changed:**
+
+- `public/` still carries **~102 MB of `.spz`** (three raw ~31 MB captures,
+  three pruned `-opt.spz`, plus older `-shrunk`/`.rad` intermediates). Nothing
+  fetches any of it now, but everything under `public/` deploys, and the three
+  raw captures are **git-tracked**. Untracking those three and moving them to
+  `assets-src/` (where `mountains-source.png` and `models-original/` already
+  live, gitignored and outside `public/`) is the cleanup — it needs a call on
+  whether to rewrite history for the already-committed blobs, so it wasn't done
+  unasked.
+- Ocean's and snow's paintings are **~1.6 MB PNGs** against mist's 434 KB JPEG.
+  Same content type, ~3.7x the bytes, on the critical path for two of three
+  themes. Re-encoding both to JPEG at mist's quality is the obvious win and
+  needs no code change (just the `backdrop.image` extension).
+
 ## Camera and environment
 
 The player is always White and rank 1 sits at z = -3.5, so the camera starts
@@ -1802,7 +2431,16 @@ override isn't present in the URL) — useful for sweeping radius/arc/skyline
 across the whole array while tuning, not for pointing at one segment
 individually.
 
-## Gaussian splat backdrop (`BACKDROP_MODE = 'splat'`) — wired, not yet placed
+## Gaussian splat backdrop — the mist capture's own history
+
+**Placement and enabling are settled by Крок 22 above; read that first.** The
+`BACKDROP_MODE` constant this section was named for is gone (Крок 18), the
+capture ships pruned as `public/sumi-e-mountain-valley-opt.spz`, and mist's
+`backdrop.mode` is `'splat'`. What survives here is the per-capture forensics
+below — file format, extent, the clutter cell at the origin, the Spark/three
+pinning constraints, and the placements that were tried and rejected — none of
+which Крок 22 invalidates. The paragraph that follows is the pre-Крок-22 state,
+kept because its reasoning is why three attempts failed.
 
 `public/sumi-e-mountain-valley-*.spz` is a real Gaussian-splat capture of the
 valley, and `components/SplatBackdrop.jsx` renders it via `@sparkjsdev/spark`.
@@ -2409,6 +3047,15 @@ npm install --no-save @gltf-transform/core @gltf-transform/extensions \
 | `probe.mjs` | live world-space AABBs of the big meshes, for "does X actually fit Y" |
 | `fogdiag.mjs` | the fog occlusion test + parity stats + dumps the generated fragment shader. Крок 13: takes a `THEME` env var (`THEME=ocean node tools/fogdiag.mjs`), defaulting to mist. |
 | `check-mask.mjs` | shoots `/dev-fog?visible=` for a1/b1/g8/c6 — the mask-orientation check |
+| `probe-splat-axes.mjs` | Крок 20: decodes a `.spz`'s raw centers and reports p01-p99 extent per axis, to determine a capture's real up-axis from data instead of eyeballing a screenshot (this environment's software rasteriser can't reliably tell a correctly- from incorrectly-oriented splat apart — see Крок 20) |
+| `shrink-spz.mjs` | **Крок 21 rewrote this.** Importance-ranked, spatially stratified, coverage-compensated `.spz` reducer (was a fixed stride, which measured 12.9 dB against the new method's 29.6 dB at the same splat count). `--stride` keeps the old policy for A/B. Use before enabling any large splat capture; client-side downsampling runs after decode and does nothing for load-time CPU cost |
+| `spz-io.mjs` | Крок 21: shared SPZ v3 decode/encode for the splat tooling, with every quantization rule taken from Spark's own `SpzReader`/`SpzWriter` source. Not a CLI |
+| `splat-importance.mjs` | Крок 21: LightGaussian-style per-splat significance, evaluated against this project's real OrbitControls clamps rather than training views. Not a CLI |
+| `splat-raster.mjs` | Крок 21: **a CPU EWA splat rasterizer in Node.** ~1.5s a frame against the browser's 100+, deterministic, models Spark's own cost levers and counts fragment evaluations. This is what makes splat quality/placement measurable at all here — reach for it before a screenshot. Not a CLI |
+| `analyze-spz.mjs` | Крок 21: opacity/scale/spatial distributions plus the contribution-concentration table (top 15% of splats carry 92.7% of the image) — how a reduction target gets chosen from data |
+| `splat-compare.mjs` | Крок 21: renders the full cloud as ground truth and reports PSNR / luma error / fragment cost for each candidate `.spz`. `--mode=outside` (default) grades the reduction policy alone; `--mode=theme` grades it in the scene |
+| `spark-levers.mjs` | Крок 21: sweeps `minAlpha`/`minPixelRadius`/`maxStdDev` against measured quality and fragment cost — found the first two inert on a pruned asset |
+| `place-splat.mjs` | Крок 21: scores candidate splat placements (nearest in-frame splat, frame coverage, luma std dev, fragment cost) over the reachable orbit. Replaces "do not try to place this from a headless screenshot" — it is a 2-minute offline command now. `--candidates=list.json` supplies a candidate set for a capture the built-in list wasn't written for. Its view ring is shallow-biased, so it does NOT answer "is this inside the resting camera's band" — see Крок 22 |
 
 Output goes to `tools/shots/`, which is gitignored.
 

@@ -30,6 +30,16 @@
 # forever — back it up somewhere else if you want to re-derive the texture.
 /assets-src/
 
+# Splat intermediates nothing references. The three pruned *-opt.spz files ARE
+# tracked (lib/themes.js points splatUrl at them, so re-enabling a theme's splat
+# stays the documented one-line change); these two are dead:
+#   *-shrunk.spz  the old fixed-stride reduction, superseded by -opt.spz
+#                 (12.94 dB vs 29.55 dB at the same splat count -- Крок 21)
+#   *.rad         Mint's own LOD/streaming container. Spark cannot parse it and
+#                 no public decoder exists -- Крок 20.
+/public/*-shrunk.spz
+/public/*.rad
+
 # Screenshots and shader dumps written by tools/shoot.mjs and tools/fogdiag.mjs.
 # The tools are checked in (they encode how the fog and rock numbers were
 # measured); their output is scratch.

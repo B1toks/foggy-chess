@@ -80,9 +80,51 @@ export function readSplatTuning(defaults = FALLBACK_DEFAULTS) {
  * set redundantly every frame until found, so no separate "found it" ref is
  * needed to avoid re-applying — assignment is idempotent.
  */
+/*
+ * Крок 21 measured all three of these instead of reasoning about them, using
+ * tools/spark-levers.mjs (a CPU rasterisation of the same capture that models
+ * each lever — see tools/splat-raster.mjs for why a CPU render is the only way
+ * to get a quality number in this environment). Measured on the shipped
+ * importance-pruned asset, against the same cloud drawn with every lever off:
+ *
+ *   setting                 PSNR      drawn    fragments
+ *   all off (truth)         -         100.0%   100.0%
+ *   minAlpha 0.02           Inf       100.0%   100.0%   <- inert
+ *   minPixelRadius 1.0      Inf       100.0%   100.0%   <- inert
+ *   maxStdDev sqrt(5)       37.8 dB    99.9%    69.5%
+ *   maxStdDev sqrt(3)       28.5 dB    99.8%    47.5%
+ *   maxStdDev sqrt(2)       23.9 dB    99.7%    35.8%
+ *
+ * Two things that changes about the previous understanding:
+ *
+ * 1. minAlpha and minPixelRadius are now COMPLETELY INERT — they cull nothing,
+ *    because tools/shrink-spz.mjs already drops sub-minAlpha splats offline and
+ *    its importance ranking already drops the sub-pixel ones. They cost nothing
+ *    and are kept only as a guard for an unpruned capture (they culled 9.3% and
+ *    94.8% of the RAW file respectively). They are no longer the perf story
+ *    they were written up as in Крок 16 Section B.
+ *
+ * 2. maxStdDev is the only lever that does anything, and what it moves is
+ *    fragment/overdraw cost, not splat count — which is exactly the cost that
+ *    dominates here. A splat backdrop at close range stacks hundreds of
+ *    Gaussians along every view ray (tools/place-splat.mjs measures ~880
+ *    fragment evaluations per pixel at ocean's shipped placement), so
+ *    rasterisation, not sorting, is what pins a GPU.
+ *
+ * Lowered sqrt(5) -> sqrt(3): 32% less fragment work for 1.6 dB, on a backdrop
+ * that sits behind fog and haze at the edge of frame. `?spstddev=` overrides it
+ * so the trade can be re-judged on a real GPU without a rebuild.
+ */
 const SPARK_MIN_ALPHA = 0.02;
 const SPARK_MIN_PIXEL_RADIUS = 1.0;
-const SPARK_MAX_STD_DEV = Math.sqrt(5);
+const SPARK_MAX_STD_DEV_DEFAULT = Math.sqrt(3);
+
+function maxStdDevFromUrl() {
+  if (typeof window === 'undefined') return SPARK_MAX_STD_DEV_DEFAULT;
+  const raw = new URLSearchParams(window.location.search).get('spstddev');
+  const n = raw !== null ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : SPARK_MAX_STD_DEV_DEFAULT;
+}
 
 /*
  * Крок 17: the SparkRenderer levers above are per-frame rasterisation/sort
@@ -105,23 +147,35 @@ const SPARK_MAX_STD_DEV = Math.sqrt(5);
  * actually sits in VRAM and gets sorted/rasterised every frame drops in
  * direct proportion to the fraction kept.
  *
- * A plain fixed-stride pick (every Nth splat) rather than a random or
- * quality-ranked one: it's a single linear pass, doesn't need a second
- * allocation to sort by size/opacity first, and thins a dense point cloud
- * roughly evenly in every region rather than biasing toward wherever the
- * data happens to be ordered by scan order. For a background element seen
- * out of focus behind fog/haze — the same reasoning that already justified
- * SparkRenderer's minAlpha/minPixelRadius/maxStdDev cuts above — a uniformly
- * thinned cloud reads as softer/hazier, not as missing detail; the user
- * asked for exactly this trade ("trochu rozmyty" — a bit soft/blurred is an
- * acceptable price for real performance headroom).
+ * Крок 21: THIS IS NOW OFF BY DEFAULT (keep fraction 1.0), and turning it back
+ * on for a normal asset would actively undo the work.
  *
- * 0.35 is a starting point, not a measured optimum — this environment can't
- * produce a real before/after fps number (see CLAUDE.md's "Headless
- * browser"). `?spkeep=` overrides it live for tuning against a real device
- * without a rebuild.
+ * The fixed-stride pick below was the wrong policy and the measurement says so
+ * plainly. Rendering the full cloud on the CPU as ground truth
+ * (tools/splat-compare.mjs) and comparing reduced versions at an IDENTICAL
+ * splat count of 100,800:
+ *
+ *   stride (what shipped)                      12.9 dB PSNR, luma error 37.5/255
+ *   importance-ranked (tools/shrink-spz.mjs)   29.6 dB PSNR, luma error  4.0/255
+ *
+ * The reason is not subtle: a stride treats a splat covering 400 pixels and one
+ * covering a quarter pixel as equally worth keeping, and a 3DGS surface is
+ * opaque only because many Gaussians overlap — so thinning uniformly does not
+ * soften the capture, it makes it TRANSPARENT and speckled. The top 15% of
+ * splats by contribution carry 92.7% of the rendered image; a 15% stride keeps
+ * 15% of it.
+ *
+ * The asset in public/ is now pre-reduced offline by importance, so every splat
+ * that arrives is one that was chosen. Applying a stride on top of that would
+ * discard the selected splats at the same rate as any others and put the
+ * speckle straight back — the two policies do not compose.
+ *
+ * Kept wired, at 1.0, purely as an emergency runtime lever: `?spkeep=0.5` still
+ * works for judging on a real device whether a given capture needs to come down
+ * further, and the honest fix for that is a smaller --count when regenerating
+ * the asset, not this.
  */
-const SPLAT_KEEP_FRACTION = 0.35;
+const SPLAT_KEEP_FRACTION = 1.0;
 const WORDS_PER_SPLAT = 4;
 
 function keepFractionFromUrl() {
@@ -189,6 +243,8 @@ export default function SplatBackdrop({ url = SPLAT_URL, defaults = FALLBACK_DEF
   const [mesh, setMesh] = useState(null);
   const tuning = useMemo(() => readSplatTuning(defaults), [defaults]);
   const sparkRendererRef = useRef(null);
+  const maxStdDevRef = useRef(null);
+  if (maxStdDevRef.current === null) maxStdDevRef.current = maxStdDevFromUrl();
 
   useEffect(() => {
     let cancelled = false;
@@ -263,7 +319,7 @@ export default function SplatBackdrop({ url = SPLAT_URL, defaults = FALLBACK_DEF
     if (renderer) {
       renderer.minAlpha = SPARK_MIN_ALPHA;
       renderer.minPixelRadius = SPARK_MIN_PIXEL_RADIUS;
-      renderer.maxStdDev = SPARK_MAX_STD_DEV;
+      renderer.maxStdDev = maxStdDevRef.current;
     }
 
     const distance = camera.position.length();

@@ -6,15 +6,20 @@ import Mountains from './Mountains';
 import SkyDome, { DOME_HORIZON_COLOR } from './SkyDome';
 import { getBackdropEdgeAlphaMap } from './proceduralTextures';
 import { basePositionFor } from './CameraRig';
-import { THEMES, themeKeyFromUrl } from '../lib/themes';
+import { THEMES, DEFAULT_THEME, themeKeyFromUrl } from '../lib/themes';
 
-const ACTIVE_THEME_KEY = themeKeyFromUrl();
-const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
+// Крок 19: was a frozen ACTIVE_THEME_KEY/ACTIVE_THEME read once at module
+// load — see git history. Live mid-game theme switching means every value
+// below that used to close over those frozen constants is now derived from
+// a `themeKey` prop instead (see deriveBackdropConfig), recomputed whenever
+// it changes. INITIAL_THEME_KEY only supplies Backdrop's default prop value.
+const INITIAL_THEME_KEY = themeKeyFromUrl();
 
 /*
  * Lazy, not a static import. @sparkjsdev/spark is 482 KB in the client bundle —
  * more than any of the current painted panoramas — and no theme currently
- * sets `backdrop.mode: 'splat'` (see USES_THEME_SPLAT below). A static import
+ * sets `backdrop.mode: 'splat'` (see deriveBackdropConfig's usesThemeSplat
+ * below). A static import
  * ships all of it to every player for a disabled feature; a dynamic one makes
  * webpack emit it as an async chunk that is only ever fetched if something
  * actually renders it.
@@ -54,16 +59,29 @@ function isLowPowerDevice() {
  * every theme its own Mint-generated panorama (`lib/themes.js`'s
  * `backdrop.image`, matching Mist's sumi-e style), so painting is now
  * theme-generic: any theme with an `image` set uses it, the same way any
- * theme with `mode: 'splat'` layers its own splat on top (USES_THEME_SPLAT
- * below). A theme with no `image` still falls back to Mountains, so that
- * rollback path stays live even though nothing currently exercises it.
+ * theme with `mode: 'splat'` layers its own splat on top (see
+ * deriveBackdropConfig's `usesThemeSplat`). A theme with no `image` still
+ * falls back to Mountains, so that rollback path stays live even though
+ * nothing currently exercises it.
  */
-const USES_PAINTING = Boolean(ACTIVE_THEME.backdrop.image) && ACTIVE_THEME.backdrop.mode !== 'procedural';
 // Крок 17: computed once at module load (this file is only ever imported
-// client-side, same as ACTIVE_THEME_KEY above) — a phone/coarse-pointer
-// device never mounts a backdrop splat for any theme, full stop.
+// client-side) — a phone/coarse-pointer device never mounts a backdrop
+// splat for any theme, full stop. A device doesn't change tier mid-session,
+// so unlike the theme-derived values below this one is fine to stay frozen.
 const IS_LOW_POWER = isLowPowerDevice();
-const USES_THEME_SPLAT = ACTIVE_THEME.backdrop.mode === 'splat' && !IS_LOW_POWER;
+
+/*
+ * Крок 19: the single source every render-time value in this file used to
+ * read from a frozen ACTIVE_THEME. Called from within the component and
+ * memoized on `themeKey`, so a live switch recomputes exactly this and
+ * nothing else needs its own parallel derivation.
+ */
+function deriveBackdropConfig(themeKey) {
+  const theme = THEMES[themeKey] ?? THEMES[DEFAULT_THEME];
+  const usesPainting = Boolean(theme.backdrop.image) && theme.backdrop.mode !== 'procedural';
+  const usesThemeSplat = theme.backdrop.mode === 'splat' && !IS_LOW_POWER;
+  return { theme, usesPainting, usesThemeSplat };
+}
 
 /*
  * The painting is a single 2560x1429 frame, NOT a seamless 360 panorama, so it
@@ -146,36 +164,42 @@ export const AZIMUTH_SWING = THREE.MathUtils.degToRad(30);
  * theme and moving ARC_DEG-per-segment toward the brief's ~140 degrees each
  * with the same overlap logic — nothing about this array's *shape* needs to
  * change for that, only its contents (see the TODO comment on the second
- * entry below). Recomputed per theme (module scope, same convention as
- * ACTIVE_THEME itself) since `src` now depends on which theme is active.
+ * entry below).
+ *
+ * Крок 19: this is a function now, not a frozen array — `src` depends on
+ * which theme is active, and that's live now instead of fixed at module
+ * load. Called from inside Backdrop() and memoized on `themeKey`.
  */
-export const BACKDROP_SEGMENTS = [
-  {
-    id: 'valley-main',
-    src: ACTIVE_THEME.backdrop.image,
-    // The direction the camera looks at rest (see ImageBackdropSegment's old
-    // `center` derivation, now per-segment) — unchanged from before this
-    // section existed, so the default view is pixel-identical to Крок 8.
-    azimuth: HOME_AZIMUTH - Math.PI,
-    arcDeg: ARC_DEG,
-    flip: true,
-  },
-  {
-    // TODO(when a second Mint frame exists per theme): replace `src` with
-    // it, and retune `azimuth`/`arcDeg` (and a third segment alongside it)
-    // toward three ~140-degree arcs with overlap, per the brief. Until then
-    // this is not a placeholder for any *specific* future segment — just
-    // enough cover that a full orbit never shows open dome.
-    id: 'valley-mirror-placeholder',
-    src: ACTIVE_THEME.backdrop.image,
-    azimuth: HOME_AZIMUTH,
-    arcDeg: ARC_DEG,
-    // Opposite of the main segment's flip: combined with the 180-degree
-    // azimuth offset above, this is "rotated and mirrored" per the brief,
-    // not just "the same frame pasted on the other side."
-    flip: false,
-  },
-];
+function backdropSegmentsFor(image) {
+  return [
+    {
+      id: 'valley-main',
+      src: image,
+      // The direction the camera looks at rest (see ImageBackdropSegment's
+      // old `center` derivation, now per-segment) — unchanged from before
+      // this section existed, so the default view is pixel-identical to
+      // Крок 8.
+      azimuth: HOME_AZIMUTH - Math.PI,
+      arcDeg: ARC_DEG,
+      flip: true,
+    },
+    {
+      // TODO(when a second Mint frame exists per theme): replace `src` with
+      // it, and retune `azimuth`/`arcDeg` (and a third segment alongside it)
+      // toward three ~140-degree arcs with overlap, per the brief. Until
+      // then this is not a placeholder for any *specific* future segment —
+      // just enough cover that a full orbit never shows open dome.
+      id: 'valley-mirror-placeholder',
+      src: image,
+      azimuth: HOME_AZIMUTH,
+      arcDeg: ARC_DEG,
+      // Opposite of the main segment's flip: combined with the 180-degree
+      // azimuth offset above, this is "rotated and mirrored" per the brief,
+      // not just "the same frame pasted on the other side."
+      flip: false,
+    },
+  ];
+}
 
 /*
  * Fog ranges are mode-dependent: the procedural shells live at r<=36 and are
@@ -194,9 +218,17 @@ export const BACKDROP_SEGMENTS = [
  * SkyDome.jsx) — matching the fog color to it exactly removes what would
  * otherwise be a visible tone seam right where the painting dissolves.
  */
-export const BACKDROP_FOG = USES_PAINTING
-  ? { color: DOME_HORIZON_COLOR, near: 44, far: 96 }
-  : { color: DOME_HORIZON_COLOR, near: 26, far: 72 };
+// Крок 19: a function of `themeKey` now (every current theme uses painting,
+// so this returns the same value for all three today, but a live switch to
+// a hypothetical theme without its own image should still get the right
+// range instead of an inherited, frozen one). GameCanvas.jsx calls this with
+// its own live `themeKey` state each render — cheap, and correct either way.
+export function backdropFogForTheme(themeKey) {
+  const { usesPainting } = deriveBackdropConfig(themeKey);
+  return usesPainting
+    ? { color: DOME_HORIZON_COLOR, near: 44, far: 96 }
+    : { color: DOME_HORIZON_COLOR, near: 26, far: 72 };
+}
 
 function readTuning() {
   if (typeof window === 'undefined') return {};
@@ -359,7 +391,10 @@ function ThemedSplatBackdrop({ url, defaults }) {
   );
 }
 
-export default function Backdrop() {
+export default function Backdrop({ themeKey = INITIAL_THEME_KEY }) {
+  const { theme, usesPainting, usesThemeSplat } = useMemo(() => deriveBackdropConfig(themeKey), [themeKey]);
+  const segments = useMemo(() => backdropSegmentsFor(theme.backdrop.image), [theme]);
+
   // Probe for every distinct image the segments reference before mounting
   // any texture loader: useTexture suspends forever on a 404, which would
   // hang the whole canvas behind Suspense. Both segments share one `src`
@@ -372,22 +407,28 @@ export default function Backdrop() {
   // procedural ridges elsewhere in the same 360 — those two read as
   // different worlds, so a partial mix would look more broken than a full
   // fallback.
+  //
+  // Крок 19: reset to false whenever the theme changes (not just at mount)
+  // and re-probe that theme's own segments — a live switch must not keep
+  // showing the PREVIOUS theme's painting while treating it as "ready" for
+  // the new one, and must not skip the fallback-to-Mountains window either.
   const [imagesReady, setImagesReady] = useState(false);
   const tuning = useMemo(readTuning, []);
 
   useEffect(() => {
-    if (!USES_PAINTING) return undefined;
+    setImagesReady(false);
+    if (!usesPainting) return undefined;
     let cancelled = false;
-    const srcs = [...new Set(BACKDROP_SEGMENTS.map((s) => s.src))];
+    const srcs = [...new Set(segments.map((s) => s.src))];
     Promise.all(srcs.map((src) => fetch(src, { method: 'HEAD' }).then((r) => r.ok)))
       .then((oks) => !cancelled && setImagesReady(oks.every(Boolean)))
       .catch(() => !cancelled && setImagesReady(false));
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [usesPainting, segments]);
 
-  if (!USES_PAINTING) {
+  if (!usesPainting) {
     return (
       <>
         <SkyDome />
@@ -395,8 +436,8 @@ export default function Backdrop() {
         {/* A theme's own splat (THEMES[key].backdrop.mode === 'splat' — none
             currently, see Крок 17/18 in CLAUDE.md for why) renders in
             addition to the procedural floor above, never instead of it. */}
-        {USES_THEME_SPLAT && (
-          <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
+        {usesThemeSplat && (
+          <ThemedSplatBackdrop url={theme.backdrop.splatUrl} defaults={theme.backdrop.splat} />
         )}
       </>
     );
@@ -412,7 +453,7 @@ export default function Backdrop() {
           largest thing in the scene. */}
       <SkyDome />
       {imagesReady ? (
-        BACKDROP_SEGMENTS.map((segment) => (
+        segments.map((segment) => (
           <ImageBackdropSegment key={segment.id} segment={segment} tuning={tuning} />
         ))
       ) : (
@@ -421,8 +462,8 @@ export default function Backdrop() {
       {/* Mounted on top of the painting, not instead of it. Tens of MB takes a
           while and may not arrive at all; the painted cylinder is the floor
           under it and costs well under a MB. */}
-      {USES_THEME_SPLAT && (
-        <ThemedSplatBackdrop url={ACTIVE_THEME.backdrop.splatUrl} defaults={ACTIVE_THEME.backdrop.splat} />
+      {usesThemeSplat && (
+        <ThemedSplatBackdrop url={theme.backdrop.splatUrl} defaults={theme.backdrop.splat} />
       )}
     </>
   );

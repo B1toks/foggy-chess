@@ -1,15 +1,16 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
 import { PIECE_HEIGHTS, PIECE_SCALE } from '../lib/pieces';
-import { THEMES, themeKeyFromUrl, pieceModelPath } from '../lib/themes';
+import { THEMES, DEFAULT_THEME, themeKeyFromUrl, pieceModelPath } from '../lib/themes';
 
-// Крок 13: read once at module load, same convention as BONE_OVERRIDE below
-// and Backdrop.jsx's readTuning — a live in-session theme switch isn't a
-// requirement here, just picking the right asset set and palette for the
-// page's own URL.
-const ACTIVE_THEME_KEY = themeKeyFromUrl();
-const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
+// Крок 19: was read once at module load into a frozen constant — see git
+// history for the original comment. Live mid-game theme switching (see
+// GameCanvas.jsx's `themeKey` state) needs every themed module to react to a
+// changing theme instead of freezing it at import time, so PieceModel now
+// takes `themeKey` as a prop and this only supplies the very first render's
+// value for callers that don't pass one (DevPieceRow.jsx's dev-only usage).
+const INITIAL_THEME_KEY = themeKeyFromUrl();
 
 // A little metalness is what lets the environment map put highlights on the
 // facets — without it the lacquer reads as matte plaster.
@@ -55,7 +56,7 @@ const LACQUER = new THREE.MeshStandardMaterial({
  * raw-vs-finished gap.
  */
 const BONE = new THREE.MeshPhysicalMaterial({
-  color: ACTIVE_THEME.pieceWhiteColor,
+  color: THEMES[INITIAL_THEME_KEY].pieceWhiteColor,
   roughness: 0.58,
   metalness: 0,
   clearcoat: 0.8,
@@ -87,11 +88,27 @@ function boneTuningFromUrl() {
   };
 }
 const BONE_OVERRIDE = boneTuningFromUrl();
+// `?bone=` still wins over any theme, initial or switched-to — a local
+// sweeping knob overriding the colour is the whole point of it.
 if (BONE_OVERRIDE.color) BONE.color = new THREE.Color(`#${BONE_OVERRIDE.color}`);
 if (BONE_OVERRIDE.roughness !== undefined) BONE.roughness = BONE_OVERRIDE.roughness;
 if (BONE_OVERRIDE.metalness !== undefined) BONE.metalness = BONE_OVERRIDE.metalness;
 if (BONE_OVERRIDE.clearcoat !== undefined) BONE.clearcoat = BONE_OVERRIDE.clearcoat;
 if (BONE_OVERRIDE.clearcoatRoughness !== undefined) BONE.clearcoatRoughness = BONE_OVERRIDE.clearcoatRoughness;
+
+/*
+ * Крок 19: BONE is a shared singleton — every white piece on the board
+ * points at this exact material object (see applyMaterial below), so
+ * mutating its `.color` in place is all a live theme switch needs to
+ * recolour every white piece already on screen, with no per-piece work and
+ * no material recreation. `?bone=` still wins if present, matching the
+ * priority the module-load code above already established.
+ */
+function syncBoneColorToTheme(themeKey) {
+  if (BONE_OVERRIDE.color) return;
+  const theme = THEMES[themeKey] ?? THEMES[DEFAULT_THEME];
+  BONE.color.set(theme.pieceWhiteColor);
+}
 
 function normalizeHeight(object3d, targetHeight) {
   const box = new THREE.Box3().setFromObject(object3d);
@@ -130,10 +147,24 @@ function applyMaterial(object3d, isWhite, fade) {
   });
 }
 
-export default function PieceModel({ type, color, fade = false, ...groupProps }) {
+export default function PieceModel({ type, color, fade = false, themeKey = INITIAL_THEME_KEY, ...groupProps }) {
   const targetHeight = PIECE_HEIGHTS[type];
-  const modelPath = pieceModelPath(ACTIVE_THEME_KEY, type);
+  const modelPath = pieceModelPath(themeKey, type);
+  // useGLTF is keyed by URL in drei's own loader cache — when `modelPath`
+  // changes (a theme switch), this suspends again for the new theme's model
+  // and re-renders with a different `scene` once it resolves, the same
+  // Suspense flow that already handles the very first mount. No manual
+  // cache invalidation needed.
   const { scene } = useGLTF(modelPath);
+
+  // Крок 19: keeps the shared BONE material's colour in step with the
+  // active theme. Runs once per mounted piece on a theme change (up to 32
+  // times) rather than once globally, but the assignment itself is a cheap
+  // in-place THREE.Color.set — not worth hoisting to a single shared effect
+  // for this.
+  useEffect(() => {
+    syncBoneColorToTheme(themeKey);
+  }, [themeKey]);
 
   const instance = useMemo(() => {
     const clone = scene.clone(true);
@@ -152,4 +183,12 @@ export default function PieceModel({ type, color, fade = false, ...groupProps })
   );
 }
 
-Object.keys(PIECE_HEIGHTS).forEach((type) => useGLTF.preload(pieceModelPath(ACTIVE_THEME_KEY, type)));
+Object.keys(PIECE_HEIGHTS).forEach((type) => useGLTF.preload(pieceModelPath(INITIAL_THEME_KEY, type)));
+
+// Крок 19: exported so the theme switcher (HUD.jsx) can preload a theme's
+// models the instant its menu opens — by the time the player actually clicks
+// an option, the GLBs are already warm in drei's loader cache and the live
+// switch resolves near-instantly instead of visibly re-suspending.
+export function preloadThemeModels(themeKey) {
+  Object.keys(PIECE_HEIGHTS).forEach((type) => useGLTF.preload(pieceModelPath(themeKey, type)));
+}

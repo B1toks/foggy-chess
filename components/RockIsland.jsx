@@ -1,11 +1,14 @@
 import { useMemo } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
-import { THEMES, themeKeyFromUrl, rockModelPath } from '../lib/themes';
+import { THEMES, DEFAULT_THEME, themeKeyFromUrl, rockModelPath } from '../lib/themes';
 
-// Крок 13: same read-once-at-module-load convention as PieceModel.jsx.
-const ACTIVE_THEME_KEY = themeKeyFromUrl();
-const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
+// Крок 19: was read once at module load — see git history. Live mid-game
+// theme switching (GameCanvas.jsx's `themeKey` state) needs this component
+// to react to a changing theme, so everything below that used to be a
+// frozen module constant derived from this is now computed per-theme inside
+// deriveRockConfig() and memoized on the `themeKey` prop instead.
+const INITIAL_THEME_KEY = themeKeyFromUrl();
 
 /*
  * Крок 9.6, Section C: replaces Plateau.jsx and its whole "continuous ground"
@@ -23,8 +26,6 @@ const ACTIVE_THEME = THEMES[ACTIVE_THEME_KEY];
  * better than a broken model, so keep the fallback path working.
  */
 export const SHOW_ROCK_ISLAND = true;
-
-const ROCK_MODEL = rockModelPath(ACTIVE_THEME_KEY);
 
 // Board slab is 8.6x8.6 (see Board.jsx's boxGeometry) — that footprint, not
 // the 8x8 playing surface inside it, is what the rock's flat top has to clear.
@@ -118,12 +119,18 @@ const ROCK_ALBEDO_FLOOR_LUMA = 55;
  * "identity" boost the way the two newer themes do).
  */
 const ROCK_THEME_EMISSIVE_FLOOR = { mist: 0, ocean: 0.12, snow: 0.12 };
-const ROCK_EMISSIVE_INTENSITY = Math.max(
-  ROCK_THEME_EMISSIVE_FLOOR[ACTIVE_THEME_KEY] ?? 0,
-  (ROCK_ALBEDO_FLOOR_LUMA - (ROCK_ALBEDO_MEAN_LUMA[ACTIVE_THEME_KEY] ?? 255)) / 255,
-);
 
-function applyRockMaterial(material) {
+function rockEmissiveIntensityFor(themeKey) {
+  return Math.max(
+    ROCK_THEME_EMISSIVE_FLOOR[themeKey] ?? 0,
+    (ROCK_ALBEDO_FLOOR_LUMA - (ROCK_ALBEDO_MEAN_LUMA[themeKey] ?? 255)) / 255,
+  );
+}
+
+// Крок 19: takes the theme's rockTint/emissiveIntensity as arguments instead
+// of closing over a frozen ACTIVE_THEME — same maths, just reactive to
+// whichever theme is live when a piece of geometry actually loads.
+function applyRockMaterial(material, rockTint, emissiveIntensity) {
   material.roughness = ROCK_ROUGHNESS;
   material.metalness = 0;
   material.flatShading = false;
@@ -134,12 +141,12 @@ function applyRockMaterial(material) {
   // Крок 13: per-theme tint (lib/themes.js's rockTint) instead of a single
   // hardcoded value — ocean/snow retint Mist's own tone toward each theme's
   // dark-square hue/saturation, keeping Mist's lightness.
-  material.color = new THREE.Color(ACTIVE_THEME.rockTint);
+  material.color = new THREE.Color(rockTint);
   // Крок 16, Section C: additive floor, themed the same as the multiply tint
   // above so a lifted-black pixel still reads as this theme's own hue rather
   // than a neutral grey glow.
-  material.emissive = new THREE.Color(ACTIVE_THEME.rockTint);
-  material.emissiveIntensity = ROCK_EMISSIVE_INTENSITY;
+  material.emissive = new THREE.Color(rockTint);
+  material.emissiveIntensity = emissiveIntensity;
   material.needsUpdate = true;
   return material;
 }
@@ -204,9 +211,6 @@ const ROCK_FIT = {
   ocean: { halfWidth: 0.37, floorY: 0.271 },
   snow: { halfWidth: 0.41, floorY: 0.577 },
 };
-const ROCK_FIT_HALF_WIDTH = ROCK_FIT[ACTIVE_THEME_KEY].halfWidth;
-const ROCK_FLOOR_Y_RAW = ROCK_FIT[ACTIVE_THEME_KEY].floorY;
-const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
 
 /*
  * Y is scaled SEPARATELY, and deliberately not by ROCK_SCALE_XZ.
@@ -231,8 +235,30 @@ const ROCK_SCALE_XZ = BOARD_HALF_WIDTH / ROCK_FIT_HALF_WIDTH;
  * shallow camera angle in either new theme.
  */
 const MIST_Y_XZ_RATIO = 7.277 / (4.3 / 0.46);
-const ROCK_SCALE_Y = ACTIVE_THEME_KEY === 'mist' ? 7.277 : ROCK_SCALE_XZ * MIST_Y_XZ_RATIO;
-const ROCK_Y_OFFSET = Y - ROCK_FLOOR_Y_RAW * ROCK_SCALE_Y;
+
+/*
+ * Крок 19: all four of the above (ROCK_FIT_HALF_WIDTH, ROCK_SCALE_XZ,
+ * ROCK_SCALE_Y, ROCK_Y_OFFSET) used to be frozen module constants derived
+ * from a frozen ACTIVE_THEME_KEY. The lookup tables and the maths are
+ * unchanged — this just re-derives the same numbers per theme instead of
+ * once, so RockModel can recompute them (memoized) whenever the `themeKey`
+ * prop changes instead of never.
+ */
+function deriveRockConfig(themeKey) {
+  const fit = ROCK_FIT[themeKey] ?? ROCK_FIT[DEFAULT_THEME];
+  const scaleXZ = BOARD_HALF_WIDTH / fit.halfWidth;
+  const scaleY = themeKey === 'mist' ? 7.277 : scaleXZ * MIST_Y_XZ_RATIO;
+  const yOffset = Y - fit.floorY * scaleY;
+  const theme = THEMES[themeKey] ?? THEMES[DEFAULT_THEME];
+  return {
+    model: rockModelPath(themeKey),
+    scaleXZ,
+    scaleY,
+    yOffset,
+    rockTint: theme.rockTint,
+    emissiveIntensity: rockEmissiveIntensityFor(themeKey),
+  };
+}
 
 /*
  * Крок 14: a smooth, uniform platform directly under the board.
@@ -302,12 +328,14 @@ function TemporaryPedestal() {
  * loaded material and its three baked maps, and only adjusts the surface
  * response. See applyRockMaterial above for why.
  *
- * Scale/position come from the constants above, measured once with
- * tools/measure-rock.mjs. This is a single static asset, so nothing here is
- * recomputed at runtime.
+ * Scale/position come from deriveRockConfig(themeKey), measured once per
+ * theme with tools/measure-rock.mjs — the numbers themselves are static, but
+ * WHICH set applies is reactive now (Крок 19), so a live theme switch swaps
+ * both the model (via useGLTF's own URL-keyed cache/Suspense) and its fit.
  */
-function RockModel() {
-  const { scene } = useGLTF(ROCK_MODEL);
+function RockModel({ themeKey }) {
+  const config = useMemo(() => deriveRockConfig(themeKey), [themeKey]);
+  const { scene } = useGLTF(config.model);
 
   const instance = useMemo(() => {
     const clone = scene.clone(true);
@@ -319,28 +347,38 @@ function RockModel() {
        * instance) but it would silently leak into any future second use of the
        * same model. Clone the material, then adjust the clone.
        */
-      node.material = applyRockMaterial(node.material.clone());
+      node.material = applyRockMaterial(node.material.clone(), config.rockTint, config.emissiveIntensity);
       // It's the lowest thing in the scene — nothing below it to shadow.
       node.castShadow = false;
       // Catches the board's own shadow, same job TemporaryPedestal's
       // receiveShadow does.
       node.receiveShadow = true;
     });
-    // Non-uniform on purpose — see ROCK_SCALE_Y's comment. three derives the
-    // normal matrix as the inverse-transpose of this, so lighting stays correct.
-    clone.scale.set(ROCK_SCALE_XZ, ROCK_SCALE_Y, ROCK_SCALE_XZ);
-    clone.position.y = ROCK_Y_OFFSET;
+    // Non-uniform on purpose — see deriveRockConfig's ROCK_SCALE_Y comment.
+    // three derives the normal matrix as the inverse-transpose of this, so
+    // lighting stays correct.
+    clone.scale.set(config.scaleXZ, config.scaleY, config.scaleXZ);
+    clone.position.y = config.yOffset;
     return clone;
-  }, [scene]);
+  }, [scene, config]);
 
   return <primitive object={instance} />;
 }
 
-export default function RockIsland() {
+// Крок 19: used to be `ROCK_MODEL ? <RockModel /> : <TemporaryPedestal />`,
+// where ROCK_MODEL was a frozen `rockModelPath(ACTIVE_THEME_KEY)` string —
+// always truthy in practice, so the check was really "has a developer
+// manually cleared this," not something that varies per theme. Preserved as
+// its own flag rather than folded away, since TemporaryPedestal is the
+// documented honest-rollback path if a regenerated rock export ever fails to
+// load for every theme at once.
+const SHOW_REAL_ROCK_MODEL = true;
+
+export default function RockIsland({ themeKey = INITIAL_THEME_KEY }) {
   if (!SHOW_ROCK_ISLAND) return null;
   return (
     <>
-      {ROCK_MODEL ? <RockModel /> : <TemporaryPedestal />}
+      {SHOW_REAL_ROCK_MODEL ? <RockModel themeKey={themeKey} /> : <TemporaryPedestal />}
       {SHOW_BOARD_PLATFORM && <BoardPlatform />}
     </>
   );

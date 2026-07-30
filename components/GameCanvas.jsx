@@ -12,13 +12,14 @@ import Board from './Board';
 import Pieces, { MOVE_DURATION } from './Pieces';
 import Fog from './Fog';
 import Lighting from './Lighting';
-import Backdrop, { BACKDROP_FOG } from './Backdrop';
+import Backdrop, { backdropFogForTheme } from './Backdrop';
 import RockIsland, { SHOW_ROCK_ISLAND } from './RockIsland';
 import { playMoveSound } from './audio';
 import HUD from './HUD';
 import IntroOverlay from './IntroOverlay';
 import PromotionModal from './PromotionModal';
 import GameOverScreen from './GameOverScreen';
+import { THEMES, themeKeyFromUrl } from '../lib/themes';
 
 // Only ever seen for the one frame before the canvas paints (or if WebGL is
 // unavailable) — SkyDome now covers the camera at every angle once mounted.
@@ -236,6 +237,36 @@ export default function GameCanvas() {
   const { game, board, turn, status, history, legalMovesFrom, isPromotion, makeMove, reset } =
     useChessGame(initialFenFromUrl());
 
+  /*
+   * Крок 19: live theme switching. Every themed module (Board, Pieces ->
+   * PieceModel, RockIsland, Backdrop, Fog -> FogShader) used to read
+   * `themeKeyFromUrl()` once at its own module load, which is exactly what
+   * made picking a theme mid-game require a full page reload — nothing
+   * downstream would ever see a change otherwise. This is now the single
+   * source of truth, threaded down as a plain prop the same way
+   * selectedSquare/hoveredSquare/pendingPromotion already are, and each
+   * themed module recomputes its theme-derived values from it instead of
+   * from a frozen constant.
+   *
+   * The URL is still kept in sync via replaceState (not pushState — a theme
+   * switch isn't a new history entry to navigate back through) purely so the
+   * page stays bookmarkable/shareable at its current theme; it is never what
+   * triggers the actual switch, and never a navigation.
+   */
+  const [themeKey, setThemeKeyState] = useState(themeKeyFromUrl);
+  function setThemeKey(key) {
+    if (key === themeKey || !THEMES[key]) return;
+    setThemeKeyState(key);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('theme', key);
+      window.history.replaceState(null, '', url.toString());
+    } catch {
+      // Non-fatal — the theme still switches live, the URL just won't
+      // reflect it until the next navigation.
+    }
+  }
+
   // One place voices every move, the player's and the AI's alike, by watching
   // the history grow. Driving it off the click instead would leave the AI
   // silent and need a second hook into lib/ — which must stay browser-free.
@@ -415,13 +446,17 @@ export default function GameCanvas() {
         // CameraRig's mount effect corrects it immediately.
         camera={{ position: INTRO_START_POSITION, fov: 42 }}
       >
-        {/* Range depends on which backdrop is mounted — see BACKDROP_FOG. The
-            colour matches the sky gradient where the ranges actually sit. */}
-        <fog attach="fog" args={[BACKDROP_FOG.color, BACKDROP_FOG.near, BACKDROP_FOG.far]} />
+        {/* Range depends on which backdrop is mounted — see
+            backdropFogForTheme. The colour matches the sky gradient where
+            the ranges actually sit. */}
+        {(() => {
+          const backdropFog = backdropFogForTheme(themeKey);
+          return <fog attach="fog" args={[backdropFog.color, backdropFog.near, backdropFog.far]} />;
+        })()}
 
         <Lighting envIntensity={tuning.envIntensity} />
-        <Backdrop />
-        {SHOW_ROCK_ISLAND && <RockIsland />}
+        <Backdrop themeKey={themeKey} />
+        {SHOW_ROCK_ISLAND && <RockIsland themeKey={themeKey} />}
 
         <Board
           board={board}
@@ -432,6 +467,7 @@ export default function GameCanvas() {
           onSelectedChange={setSelectedSquare}
           onHoveredChange={setHoveredSquare}
           onPendingPromotionChange={setPendingPromotion}
+          themeKey={themeKey}
         />
         <Pieces
           board={board}
@@ -440,6 +476,7 @@ export default function GameCanvas() {
           historyLength={history.length}
           selectedSquare={phase === 'playing' ? selectedSquare : null}
           hoveredSquare={phase === 'playing' ? hoveredSquare : null}
+          themeKey={themeKey}
         />
 
         {/* Separate from the shadow map: a soft dark pool directly under each
@@ -474,7 +511,12 @@ export default function GameCanvas() {
             real starting position rather than a 64-square dissolve firing on the
             hand-off frame. See ALL_VISIBLE above. */}
         {showFog && (
-          <Fog visibility={fogVisibility} lastMove={lastMove} enemyPieceSquares={enemyPieceSquares} />
+          <Fog
+            visibility={fogVisibility}
+            lastMove={lastMove}
+            enemyPieceSquares={enemyPieceSquares}
+            themeKey={themeKey}
+          />
         )}
 
         {phase === 'playing' ? (
@@ -558,10 +600,13 @@ export default function GameCanvas() {
         visibleCount={visibility.size}
         onNewGame={reset}
         showGameplay={phase === 'playing'}
-        fen={game.fen()}
+        themeKey={themeKey}
+        onThemeChange={setThemeKey}
       />
 
-      {phase === 'intro' && <IntroOverlay onStart={handleStart} />}
+      {phase === 'intro' && (
+        <IntroOverlay onStart={handleStart} activeTheme={themeKey} onThemeChange={setThemeKey} />
+      )}
 
       {/* Крок 14, Section B: gated on `phase === 'playing'` specifically, not
           just the status — the instant "Play Again" flips phase to
