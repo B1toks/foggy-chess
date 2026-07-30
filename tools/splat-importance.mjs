@@ -47,13 +47,15 @@ export const CAMERA = {
 /**
  * Splat placements as they ship in lib/themes.js (backdrop.splat). Keep these
  * in step with that file — `--theme=` weighting is placement-locked, so a stale
- * entry here silently scores a transform nothing renders. Ocean's is the one
- * this project's own notes call broken and expensive (Крок 21); it is recorded
- * as-shipped on purpose, not as a recommendation.
+ * entry here silently scores a transform nothing renders.
+ *
+ * Крок 24: ocean's entry is no longer the broken scale-12-at-the-origin one
+ * this comment used to warn about; it is the derived placement that ships, and
+ * ocean is the only theme currently on `mode: 'splat'`.
  */
 export const THEME_PLACEMENTS = {
   mist: { scale: 0.42, rotation: [0, -196.6, 0], position: [-22.8, -38.7, 55.5] },
-  ocean: { scale: 12, rotation: [0, 0, 0], position: [0, 0, 0] },
+  ocean: { scale: 1.847, rotation: [0, 135, 0], position: [-17.33, -45.17, 53.25] },
   snow: { scale: 1.2, rotation: [-90, 0, 0], position: [-20.7, -21.3, 62.4] },
 };
 

@@ -111,13 +111,27 @@ export function readSplatTuning(defaults = FALLBACK_DEFAULTS) {
  *    fragment evaluations per pixel at ocean's shipped placement), so
  *    rasterisation, not sorting, is what pins a GPU.
  *
- * Lowered sqrt(5) -> sqrt(3): 32% less fragment work for 1.6 dB, on a backdrop
- * that sits behind fog and haze at the edge of frame. `?spstddev=` overrides it
- * so the trade can be re-judged on a real GPU without a rebuild.
+ * Крок 21 lowered this to sqrt(3): 32% less fragment work for 1.6 dB, on a
+ * backdrop that sits behind fog and haze at the edge of frame.
+ *
+ * Крок 24 puts it back to sqrt(5), the value the table above measures at
+ * 37.8 dB. Two reasons the Крок 21 trade no longer applies as written:
+ *
+ *   - Its premise was ocean's shipped placement and its ~880 fragment
+ *     evaluations per pixel. That placement is the "camera inside the cloud"
+ *     one, and it is gone (see lib/themes.js's ocean.backdrop). At the derived
+ *     placement the whole frame costs ~3.0M fragments, comparable to mist's
+ *     2.7M — there is no longer a fragment budget crisis to buy 1.6 dB out of.
+ *   - sqrt(5) is the setting the splat-lab A/B judged this exact capture on,
+ *     and the one tools/splat-raster.mjs's own SPARK_DEFAULTS model, so the
+ *     offline numbers throughout this project now describe what actually ships.
+ *
+ * `?spstddev=` still overrides it, so the trade can be re-judged on a real GPU
+ * without a rebuild — sqrt(3) is the first lever to pull back if fps demands it.
  */
 const SPARK_MIN_ALPHA = 0.02;
 const SPARK_MIN_PIXEL_RADIUS = 1.0;
-const SPARK_MAX_STD_DEV_DEFAULT = Math.sqrt(3);
+const SPARK_MAX_STD_DEV_DEFAULT = Math.sqrt(5);
 
 function maxStdDevFromUrl() {
   if (typeof window === 'undefined') return SPARK_MAX_STD_DEV_DEFAULT;
@@ -236,7 +250,28 @@ function downsampleSplats(packed, keepFraction) {
 const HIDE_DISTANCE = 9.5;
 const HIDE_MAX_POLAR_ANGLE = 0.65;
 
+/*
+ * `?spurl=` swaps the capture itself, the same read-once-from-the-URL
+ * convention every other `?sp*=` knob here uses. It exists so an alternative
+ * asset can be A/B'd against the shipped one on real hardware without a
+ * rebuild or a committed default — the one measurement this environment
+ * genuinely cannot make (see CLAUDE.md's "Headless browser").
+ *
+ * Restricted to same-origin absolute paths on purpose: this value goes
+ * straight into a fetch, and there is no reason a tuning knob should be able
+ * to point the loader at another host.
+ */
+function splatUrlOverride() {
+  if (typeof window === 'undefined') return null;
+  const raw = new URLSearchParams(window.location.search).get('spurl');
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return null;
+  return raw;
+}
+
 export default function SplatBackdrop({ url = SPLAT_URL, defaults = FALLBACK_DEFAULTS, onReady }) {
+  const urlOverrideRef = useRef(undefined);
+  if (urlOverrideRef.current === undefined) urlOverrideRef.current = splatUrlOverride();
+  url = urlOverrideRef.current ?? url;
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   const camera = useThree((s) => s.camera);

@@ -71,6 +71,26 @@ function isLowPowerDevice() {
 const IS_LOW_POWER = isLowPowerDevice();
 
 /*
+ * Крок 25: `?spforce=1` mounts a theme's splat regardless of its own
+ * `backdrop.mode` — the missing piece for keeping a splat placement reachable
+ * as a bookmarkable test link after its theme reverts to `mode: 'image'`.
+ * Without this, every other `?sp*=` knob (`spurl`, `spscale`, `spstddev`, …)
+ * is inert whenever `mode !== 'splat'`, because `usesThemeSplat` below never
+ * mounts `SplatBackdrop` in the first place for those knobs to reach — a
+ * URL that worked while Крок 24 shipped `mode: 'splat'` would silently stop
+ * doing anything the moment the default reverted, which defeats the point of
+ * a saved link. Same read-once-at-module-load convention as `IS_LOW_POWER`
+ * right above it. Still gated by `IS_LOW_POWER` — a forced splat is still an
+ * explicit, deliberate test, not a reason to skip the mobile/coarse-pointer
+ * safety net.
+ */
+function splatForceFromUrl() {
+  if (typeof window === 'undefined') return false;
+  return new URLSearchParams(window.location.search).get('spforce') === '1';
+}
+const SPLAT_FORCE = splatForceFromUrl();
+
+/*
  * Крок 19: the single source every render-time value in this file used to
  * read from a frozen ACTIVE_THEME. Called from within the component and
  * memoized on `themeKey`, so a live switch recomputes exactly this and
@@ -79,7 +99,7 @@ const IS_LOW_POWER = isLowPowerDevice();
 function deriveBackdropConfig(themeKey) {
   const theme = THEMES[themeKey] ?? THEMES[DEFAULT_THEME];
   const usesPainting = Boolean(theme.backdrop.image) && theme.backdrop.mode !== 'procedural';
-  const usesThemeSplat = theme.backdrop.mode === 'splat' && !IS_LOW_POWER;
+  const usesThemeSplat = (theme.backdrop.mode === 'splat' || SPLAT_FORCE) && !IS_LOW_POWER;
   return { theme, usesPainting, usesThemeSplat };
 }
 
@@ -366,14 +386,32 @@ function ImageBackdropSegment({ segment, tuning }) {
  */
 const SPLAT_LOAD_BUDGET_MS = 4000;
 
+/*
+ * `?spbudget=` (milliseconds) raises that window for a deliberate experiment.
+ * A heavier capture loaded via SplatBackdrop.jsx's own `?spurl=` can easily
+ * need more than 4s to fetch and decode, and without this the budget silently
+ * unmounts it — which reads as "the splat is broken" rather than "the guard
+ * fired". Both this and `?spurl=` exist for the same reason: the fps/VRAM
+ * question can only be answered on a real device, and it should be answerable
+ * without a rebuild or a committed default.
+ */
+function splatLoadBudgetMs() {
+  if (typeof window === 'undefined') return SPLAT_LOAD_BUDGET_MS;
+  const raw = new URLSearchParams(window.location.search).get('spbudget');
+  const n = raw !== null ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : SPLAT_LOAD_BUDGET_MS;
+}
+
 function ThemedSplatBackdrop({ url, defaults }) {
   const [timedOut, setTimedOut] = useState(false);
   const readyRef = useRef(false);
+  const budgetRef = useRef(null);
+  if (budgetRef.current === null) budgetRef.current = splatLoadBudgetMs();
 
   useEffect(() => {
     const timer = setTimeout(() => {
       if (!readyRef.current) setTimedOut(true);
-    }, SPLAT_LOAD_BUDGET_MS);
+    }, budgetRef.current);
     return () => clearTimeout(timer);
   }, []);
 

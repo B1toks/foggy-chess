@@ -2099,10 +2099,18 @@ was **stale** for mist and snow (it still held pre-Крок-21 transforms while
 claiming to mirror `lib/themes.js`); it is corrected, and it matters because
 `--theme=` weighting is placement-locked.
 
-## Крок 23: splats off, painted panoramas ship — this is the final state
+## Крок 23: splats off, painted panoramas ship
 
-**All three themes are on `backdrop.mode: 'image'`.** Splat work is stopped;
-this is the shipping configuration, not another revert mid-investigation.
+> **Superseded for Ocean by Крок 24 below** — ocean is on `mode: 'splat'` now,
+> at a derived placement, on the strength of a visual A/B this pass did not
+> have. Mist and snow are still exactly as this section leaves them, and
+> everything below about *why* the painted floor is the safe default still
+> stands. This section's original title called this "the final state"; it was
+> the final state of the splat *investigation*, not a permanent verdict.
+
+**All three themes were put on `backdrop.mode: 'image'`.** Splat work is
+stopped; this is the shipping configuration, not another revert
+mid-investigation.
 
 The reasoning is the one this file already establishes and never resolved: the
 only real-hardware signal any splat placement ever produced was **20fps / 90%
@@ -2150,6 +2158,307 @@ load on `/`), and a production `npm start` serves `/`, `/?theme=ocean` and
   Same content type, ~3.7x the bytes, on the critical path for two of three
   themes. Re-encoding both to JPEG at mist's quality is the obvious win and
   needs no code change (just the `backdrop.image` extension).
+
+## Крок 24: Ocean's splat back on, at a derived placement
+
+**Ocean is `mode: 'splat'`; mist and snow stay on `'image'`.** Крок 23's "final
+state" held for the two themes that were never re-tested; ocean's was revisited
+because a splat-lab A/B judged the 60,000-splat importance-pruned sea-canyon
+asset near-indistinguishable from the full 1.92M cloud, which is the visual
+evidence Крок 23 said it did not have.
+
+**The asset did not change and did not need to.**
+`public/ink-wash-sea-canyon-opt.spz` is Крок 21's file, unmodified: importance-
+ranked, **no `--declutter`**, 60,000 splats, 1.05 MB. Re-confirmed before use
+with `tools/probe-splat-axes.mjs` — 60,000 splats, Y-up (p01-p99 spread 14.89 on
+Y vs 27.58/27.71 on X/Z), so snow's `rotX -90` correction stays off it, per Крок
+20's own lesson about copying that onto an already-Y-up capture.
+
+`SPARK_MAX_STD_DEV_DEFAULT` went **sqrt(3) -> sqrt(5)** (`SplatBackdrop.jsx`).
+Крок 21 lowered it to buy fragment cost back at ocean's *old* placement and its
+~880 evaluations per pixel; that placement is gone, the new one costs ~3.0M
+fragments a frame, and sqrt(5) is both the 37.8 dB row in that file's own table
+and what `tools/splat-raster.mjs`'s `SPARK_DEFAULTS` already model — so the
+offline numbers now describe what ships. `?spstddev=` still overrides it.
+
+### The placement, derived the same way Крок 22 derived mist's
+
+`{ scale: 1.847, rotation: [0, 135, 0], position: [-17.33, -45.17, 53.25] }`,
+replacing `scale 12` at the origin — the transform this file has recorded as
+broken since Крок 21 (camera *inside* the cloud, ~880 fragment evaluations per
+pixel). Position is 60 world units out along the painted main segment's own
+azimuth (`HOME_AZIMUTH - PI` = -22.4 deg), sunk so the body spans 21..38 degrees
+below horizontal from the resting camera at y=7 — the same visible-band
+derivation `Backdrop.jsx`'s `TOP_Y` uses. `rotY 135` is measured, not chosen by
+eye: of eight rotations scored it gave the highest rest coverage at essentially
+the best nearest-splat distance with zero coverage 180 degrees away.
+
+Крок 22's trap applies here too and was avoided the same way — candidates were
+scored against the **resting camera explicitly**, not just `place-splat.mjs`'s
+shallow-biased ring. Distance is confirmed to be one point on a line: D=45/60/75
+at the same angular band scored identical coverage and detail, exactly the
+scale-and-push invariance Крок 22 documents.
+
+| placement | nearest | rest cov | rest detail | rest Mfrag | behind cov |
+|---|---|---|---|---|---|
+| mist (Крок 22 reference) | 45.5 | 0.410 | 0.100 | 2.7 | 0.000 |
+| snow (Крок 21 reference) | 35.6 | 0.418 | 0.108 | 5.5 | — |
+| **ocean SHIPPED (this pass)** | **50.5** | **0.440** | **0.216** | **3.0** | **0.000** |
+| ocean OLD (scale 12 at origin) | 14.4 | 0.383 | 0.232 | 21.9 | — |
+
+**One derivation detail worth not re-deriving: fit the band to the body's
+UNWEIGHTED positional p01..p99 (height 14.89), not an importance-weighted
+extent.** Importance-weighting reports height 51 and collapses the island to 2%
+frame coverage, because importance ranking *favours* this capture's detached-
+clutter tail — those splats are large and opaque, the same property that makes
+`--declutter` matter for snow. This cost a full scoring pass before it was spotted.
+
+### `--declutter` stays off, and this is now measured for ocean specifically
+
+The no-declutter call came from the lab A/B; it is independently confirmed here.
+Built a `--declutter=100` variant at the identical count and rendered both at the
+resting camera: it takes frame coverage **0.435 -> 0.105** and leaves scattered
+fragments rather than an island (`tools/shots/ab-declutter100.png`). Same
+per-capture result mist showed — `--declutter` is right for snow's capture and
+wrong for this one; the flag is per-capture, never a house style.
+
+**The residual cosmetic issue, flagged not fixed:** that clutter tail is still
+present, and at rest it reads as a few soft dark blobs floating in the sky at the
+frame corners. It is in the full 1.92M cloud too, so it is the capture's own
+content rather than a pruning artifact — which is exactly why the lab A/B scored
+the pruned file as faithful. Declutter is not the fix (above). A milder
+`--declutter=20..30` is the untested middle if it ever matters enough.
+
+### Verified
+
+`npm test` 17/17; `next build` clean (84.9 kB first load on `/`, Spark still a
+lazy async chunk); production `npm start` serves `/`, `/?theme=ocean`,
+`/?theme=snow`, the `.spz` and the painting all 200.
+
+In-browser against the production build, `?theme=ocean&debug=1`: `window.__splat`
+reaches `{state: 'ready', count: 60000}` — the pruned count exactly, proving no
+client-side stride ran on top of it (`SPLAT_KEEP_FRACTION` is 1.0 and must stay
+there for a pre-pruned asset) — with no console or page errors, and the live
+`SplatMesh` reads back `scale 1.847 / position [-17.33, -45.17, 53.25] / rotY
+135` with `SparkRenderer` at `minAlpha 0.02, minPixelRadius 1, maxStdDev 2.2361`
+(= sqrt(5)), i.e. transform and levers really applied.
+
+Two environment notes, both already documented and both hit again: the splat
+never mounts below a 768px-wide viewport (`isLowPowerDevice`), and
+`SPLAT_LOAD_BUDGET_MS` (4000) must be raised temporarily for a headless run or
+`ThemedSplatBackdrop` unmounts before ready — **it was raised to 120000 for this
+verification and put back to 4000**.
+
+The painting still renders underneath (`usesPainting` is true whenever `image` is
+set and `mode` is not `'procedural'`), so this is a horizon band layered on the
+proven-fast floor, never a replacement for it — and coverage 180 degrees away is
+0, so the painted segments carry the rest of the orbit unaided.
+
+**Real fps/VRAM remains unmeasured here**, as everywhere else in this file.
+`?debug=1`'s `FpsCounter` on real hardware is the check; `?spstddev=` (try
+sqrt(3) first) and `?spkeep=` tune it without a rebuild, and
+`ocean.backdrop.mode` back to `'image'` is the one-line revert onto a floor
+already proven fast.
+
+### An enclosing placement was investigated and is NOT viable with a pruned asset
+
+Asked for directly: make the capture a surrounding environment (cave/canyon
+walls around the play area) with the camera inside it, using the 60,000-splat
+pruned asset rather than the raw 1.92M file that caused the original
+20fps/90%-VRAM report. Measured, not argued — and the premise turns out to be
+inverted, so record the result rather than retrying it.
+
+**This capture does have an interior, unlike mist's.** An importance-weighted
+radial mass profile over the standing elevation band puts only 8.1% of mass
+inside local r<5.7, with 53% concentrated in a rim at r 11.4..15.7 — a genuine
+shell with a clearing. So "camera inside" is geometrically possible here, which
+is why this was worth measuring instead of dismissing on mist's precedent.
+
+**But importance pruning is the wrong optimisation for close range, and it is
+wrong by construction.** The pruner keeps the LARGE splats (the shipped file's
+mean scale is 5.2x the source's — CLAUDE.md's Крок 21 says so explicitly). At
+backdrop distance those carry the image; with the camera inside them they smear
+into blobs. Same placement (scale 2.5, rotY 135, body median at camera height),
+same raster, rest view:
+
+| asset | splats | MB | coverage | detail | frag/px | reads as |
+|---|---|---|---|---|---|---|
+| pruned (shipped) | 60,000 | 1.0 | 0.787 | 0.188 | 531 | smeared blur |
+| re-pruned `--maxgain=1.0` | 200,000 | 3.3 | 0.920 | 0.100 | 1088 | speckled, some structure |
+| re-pruned `--maxgain=1.0` | 600,000 | 9.9 | 0.987 | 0.071 | 1506 | **real cave interior** |
+| full cloud | 1,920,000 | 31.0 | 0.990 | 0.071 | 1580 | real cave interior |
+| **shipped BACKDROP placement** | 60,000 | 1.0 | 0.319 | 0.203 | **33** | horizon band |
+
+Two things fall out, and they close the question:
+
+1. **The look requires ~600,000 splats** — the 60k asset cannot produce it at any
+   scale/position. Every enclosing candidate swept with it (scales 1.5-16, three
+   height offsets, plus eye-level variants) scored coverage 0.79-0.98 against
+   detail 0.026-0.13, which is `place-splat.mjs`'s own documented signature for a
+   flat wall rather than a vista, and every render confirmed it.
+2. **At that count it costs ~1506 frag/px, ~45x the shipped backdrop's 33** — and
+   ~4.4x the old broken scale-12 placement (342 frag/px measured the same way),
+   which is the placement that already produced 20fps/90% VRAM on real hardware.
+
+So pruning that makes the enclosing placement affordable destroys the look, and
+pruning that preserves the look does not make it affordable. **Do not re-attempt
+this with a different scale/position** — the sweep above already covers the range,
+and the binding constraint is covered area per pixel, which placement cannot
+change while keeping the camera inside. A genuinely enclosing splat world for
+this scene needs a capture authored as an interior (dense, small Gaussians near
+the viewer), not a re-placement of this one.
+
+Note also `detail` *inverts* its usual meaning here: the 60k blur scores the
+highest detail (0.188) of the enclosing candidates because its speckle is
+high-variance noise, while the good 600k cave scores 0.071. Luma std dev
+separates a vista from a wall at backdrop distance; it does not separate
+structure from noise at point-blank range. Use the renders for that.
+
+**In the real scene it looks better than the CPU raster alone suggests**, and
+that is worth knowing before judging the numbers above too harshly: the raster
+renders the splats unoccluded, but in the game the board, rock, pieces and fog
+fill the middle of the frame, so the 600k enclosing placement reads as genuine
+cave walls wrapping the play area (`tools/shots/enc-browser-rest.png`, shot
+against a production build). The look is not in question — only the cost is.
+
+**Two URL knobs exist so that cost can be settled on a real device without a
+rebuild or a committed default**, since that is the one measurement this
+environment cannot make:
+
+- **`?spurl=`** (`SplatBackdrop.jsx`) swaps the capture. Restricted to
+  same-origin absolute paths — the value goes straight into a fetch.
+- **`?spbudget=`** (`Backdrop.jsx`) raises `SPLAT_LOAD_BUDGET_MS` (4000) for a
+  deliberate experiment. Needed because a heavier capture routinely takes longer
+  than 4s to fetch and decode, and the guard firing silently unmounts it —
+  which reads as "the splat is broken" rather than "the guard worked". This was
+  confirmed both ways here: at the stock budget the headless run reports
+  `state: 'loading'` with a null mesh, and with `?spbudget=240000` the same run
+  reaches `{state: 'ready', count: 600000}`.
+
+The test asset ships in `public/` as `ocean-close-600k.spz` (10.4 MB,
+`--count=600000 --maxgain=1.0`, no declutter). **It is a test artifact, not a
+shipped one** — nothing references it, and it should be deleted along with the
+other unreferenced `.spz` files (Крок 23's loose end) once the real-device
+question is settled either way.
+
+The full enclosing test URL, for the record:
+
+```
+/?theme=ocean&debug=1&spurl=/ocean-close-600k.spz
+  &spscale=2.5&sprotY=135&spposX=7.46&spposY=-16.9&spposZ=-3.01&spbudget=240000
+```
+
+**Ocean's shipped default is unchanged by any of this** — still the Крок 24
+backdrop placement at 33 frag/px. Nothing about the enclosing experiment is
+committed to the theme registry.
+
+## Крок 25: the enclosing placement, tested on real hardware, and reverted
+
+Continuing straight from Крок 24's enclosing-placement investigation, three
+more iterations happened before a real-device test settled it:
+
+1. **A clearance fix.** The first enclosing candidate (scale 2.5, anchored at
+   the capture's own mass centroid) measured only 2.59 world units of
+   clearance between the board+rock cylinder and the nearest opaque splat —
+   confirmed both numerically and visually (an edge-camera screenshot showed
+   the misty wall starting right at the board's back rank, no gap). The fix
+   was changing *which* local point gets anchored to the board's floor, not
+   the scale: the capture's vertical mass profile put 21.6% of its content in
+   one dense top band (its ceiling), so anchoring a lower local point (`floor
+   = 6.6`, versus the centroid's `9.56`) sinks the whole cave and moves the
+   camera into a sparser band. Three candidates (A/B/C) were offered; the user
+   picked **B** (scale 4, `floor 6.6`) as "closest so far" after a live check.
+2. **A 2-3x scale-up request, checked before running.** The transform is a
+   rigid dilation about a fixed anchor that maps exactly to the board's own
+   centre: `world = scale * R * (local - anchor)`. Two things followed from
+   that algebraically and were confirmed numerically before handing over a
+   URL (`tools/_tmp-scaleup-check.mjs`, not kept): clearance can only improve
+   with scale (content far from the anchor is pushed proportionally farther
+   away), and fragment cost stays roughly flat across scale — measured 386 →
+   464 → 435 → 396 → 415 frag/px for scale 4 → 6 → 8 → 10 → 12, because a pure
+   dilation keeps splats' angular size roughly constant as seen from a fixed
+   camera (world size and distance from camera both scale by the same
+   factor). Scale 10 (2.5x variant B) was handed over as a single URL on that
+   basis — clearance 25.4, wall radius 125 (vs B's 51), at 396 frag/px
+   (essentially B's own 386).
+3. **Real-device result: 165fps on the on-screen counter, 95% GPU, and
+   visible stutter — and the world did not read as farther away despite the
+   2.5x scale-up.** Both observations are real and both are explained by the
+   same thing, not two separate problems:
+   - **The fps counter and the actual experience disagreeing is the far more
+     important signal, and the counter is the one to distrust.**
+     `HUD.jsx`'s `FpsCounter` counts `requestAnimationFrame` callbacks; on a
+     saturated GPU with vsync/compositor behaviour that decouples the
+     callback rate from actually-presented frames, that count can read high
+     while the user visibly experiences stutter. 95% GPU utilisation plus
+     visible stutter is the ground truth here — a high number on a counter
+     that measures callback frequency, not presented frames, does not
+     override what the eye and the GPU meter both reported. This is the same
+     class of caution CLAUDE.md already carries for this environment's OWN
+     `FpsCounter` reading 60 regardless of real cost (see "Headless
+     browser") — the lesson generalises: an FPS counter is only as
+     trustworthy as its relationship to the compositor, on any device.
+   - **The world not appearing to recede is the direct, predictable
+     consequence of the placement being a dilation about a point the camera
+     is (relatively) close to.** As scale grows, both a splat's world size
+     and its distance from the fixed camera position grow by the same
+     factor, so its *angular* size — how big it looks on screen — stays
+     roughly constant. Geometric radius genuinely doubled (measured: wall
+     radius 51 → 125), but perceived distance does not track geometric
+     radius here the way it would for a placement where the camera sits
+     outside the dilated body (which is exactly what the Крок 24 backdrop
+     placement does, and exactly why doubling THAT placement's distance
+     really would read as "farther away"). This was flagged as a
+     risk during Крок 24's own reasoning about far-field angular-size
+     invariance but not surfaced to the user at the time; the real-device
+     report confirms it as an actual, not just theoretical, effect.
+
+**Decision: stop iterating, revert Ocean's default to `mode: 'image'`, keep
+the enclosing placement reachable via an explicit saved link.** This was the
+user's own call, made in advance ("if scaling up pushes cost or complexity
+into diminishing returns, tell me honestly and we'll cut losses... I don't
+want to keep iterating indefinitely on this one theme") and confirmed once
+the real-device result came back exactly as that clause anticipated.
+
+**The saved link needed one more piece of machinery, not just flipping
+`mode` back.** `Backdrop.jsx`'s `usesThemeSplat` was gated purely by
+`theme.backdrop.mode === 'splat'` — every other `?sp*=` knob (`spurl`,
+`spscale`, `spstddev`, …) only has any effect once `SplatBackdrop` actually
+mounts, so reverting `mode` to `'image'` would have silently broken every
+previously-working test URL, including the one about to be handed over as
+"the saved link." Added **`?spforce=1`** (`Backdrop.jsx`, same
+read-once-at-module-load convention as `IS_LOW_POWER` right next to it):
+mounts a theme's splat regardless of its own `backdrop.mode`, still gated by
+`IS_LOW_POWER` (a forced splat is still an explicit test, not a reason to
+skip the mobile/coarse-pointer safety net). Verified both directions against
+a production build: `/?theme=ocean&debug=1` now reports `window.__splat ===
+null` (nothing mounts), and the saved link below reaches `{state: 'ready',
+count: 600000}` with no console errors.
+
+The saved link, for reproducing variant B scaled to 10 (2.5x):
+
+```
+/?theme=ocean&debug=1&spforce=1&spurl=/ocean-close-600k.spz
+  &spscale=10&sprotY=135&spposX=29.84&spposY=-66&spposZ=-12.02
+  &spstddev=1.732&spbudget=240000
+```
+
+`spbudget` (Крок 24) is required in this URL specifically because the
+600,000-splat test asset (10.4 MB) routinely takes longer than the
+production `SPLAT_LOAD_BUDGET_MS` (4000) to fetch and decode; without it the
+splat silently times out and unmounts. `public/ocean-close-600k.spz` is
+**committed** (not left untracked like the earlier `ocean_scene.spz`
+duplicate) specifically so this link keeps working once deployed — Vercel
+only serves what's actually pushed.
+
+`lib/themes.js`'s `ocean.backdrop.mode` is `'image'` again; `splatUrl` and
+`splat` (still the Крок 24 horizon-band placement, 33 frag/px, unaffected by
+any of this section) stay wired, same convention as mist/snow — re-enabling
+is still `mode: 'image' -> 'splat'` on one field if a real-device signal ever
+justifies it again. The enclosing-placement family (variant B, scale 10, or
+anything derived the same way) is not wired into the registry at all and was
+never meant to be — it lives only behind `?spforce=1` and its own explicit
+`?sp*=` parameters.
 
 ## Camera and environment
 
