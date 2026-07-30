@@ -3,7 +3,7 @@
 3D chess with fog of war: you only see the squares your own pieces hold under
 attack. Everything else is fog — and your opponent is somewhere inside it.
 
-**Play: https://foggy-chess.vercel.app**
+**Play: https://foggy-chess-9gif.vercel.app/**
 
 You are White. Black is a greedy AI that takes the most valuable capture on
 offer and otherwise moves at random. Vision is recomputed after every move, so
