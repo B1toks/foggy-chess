@@ -2460,6 +2460,28 @@ anything derived the same way) is not wired into the registry at all and was
 never meant to be — it lives only behind `?spforce=1` and its own explicit
 `?sp*=` parameters.
 
+**Follow-up, same pass: the saved link hid and re-showed the splat
+constantly while orbiting.** `SplatBackdrop.jsx`'s own `HIDE_DISTANCE`/
+`HIDE_MAX_POLAR_ANGLE` (Крок 16 Section B) sets `mesh.visible = false`
+whenever the camera is both close (< 9.5) and steep/overhead (polar angle <
+0.65 rad) — correct for a distant backdrop (skip rendering far sky once the
+board fills the frame) and wrong for an enclosing placement, where the
+capture is the near surroundings the player is meant to be looking at. The
+game's own `MIN_DISTANCE` (8) and `MIN_POLAR_ANGLE` (0.38) sit entirely
+inside that hide zone, so ordinary orbiting/zooming crossed the boundary on
+almost every frame — reported as "hides and blinks constantly." Fixed by
+having `SplatBackdrop` read `?spforce=1` itself (same value `Backdrop.jsx`
+already reads to mount the splat at all) and skip the hide check entirely
+when it's set: a caller that explicitly forced the splat on outside its
+theme's own `mode` has already opted out of "this is a theme's default
+backdrop," which is the only case the heuristic is for. No new URL
+parameter — the existing `spforce=1` in the saved link now does both jobs.
+Verified directly (not by eye — this environment can't judge that): drove
+`window.__camera`/`__controls` to the exact old hide zone (distance 8.5,
+polar 0.45) and to the game's absolute closest/steepest corner (distance 8,
+polar 0.38) and read the live mesh's own `.visible` back — `true` at both,
+where the old code would have read `false`.
+
 ## Camera and environment
 
 The player is always White and rank 1 sits at z = -3.5, so the camera starts

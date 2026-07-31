@@ -251,6 +251,25 @@ const HIDE_DISTANCE = 9.5;
 const HIDE_MAX_POLAR_ANGLE = 0.65;
 
 /*
+ * Krok 25: the hide heuristic above is specifically about a DISTANT
+ * backdrop -- "the board fills the frame, so the far sky contributes
+ * little, skip it." An enclosing placement (reached via ?spforce=1, see
+ * Backdrop.jsx) inverts that premise: the capture IS the nearby
+ * surroundings, and MIN_DISTANCE/MIN_POLAR_ANGLE sit well inside this hide
+ * zone, so ordinary orbiting crossed the boundary constantly and the mesh
+ * toggled visible/invisible every frame -- reported as "hides and flickers
+ * constantly." Forced splats skip this check entirely rather than needing
+ * their own re-tuned thresholds: a caller that explicitly forced the splat
+ * on outside its theme's own mode has already opted out of "this is being
+ * used as a theme's default backdrop," which is the only case this
+ * heuristic is for.
+ */
+function splatForceFromUrl() {
+  if (typeof window === 'undefined') return false;
+  return new URLSearchParams(window.location.search).get('spforce') === '1';
+}
+
+/*
  * `?spurl=` swaps the capture itself, the same read-once-from-the-URL
  * convention every other `?sp*=` knob here uses. It exists so an alternative
  * asset can be A/B'd against the shipped one on real hardware without a
@@ -280,6 +299,8 @@ export default function SplatBackdrop({ url = SPLAT_URL, defaults = FALLBACK_DEF
   const sparkRendererRef = useRef(null);
   const maxStdDevRef = useRef(null);
   if (maxStdDevRef.current === null) maxStdDevRef.current = maxStdDevFromUrl();
+  const forceRef = useRef(undefined);
+  if (forceRef.current === undefined) forceRef.current = splatForceFromUrl();
 
   useEffect(() => {
     let cancelled = false;
@@ -357,9 +378,13 @@ export default function SplatBackdrop({ url = SPLAT_URL, defaults = FALLBACK_DEF
       renderer.maxStdDev = maxStdDevRef.current;
     }
 
-    const distance = camera.position.length();
-    const cosPolar = camera.position.y / distance;
-    mesh.visible = !(distance < HIDE_DISTANCE && cosPolar > Math.cos(HIDE_MAX_POLAR_ANGLE));
+    if (forceRef.current) {
+      mesh.visible = true;
+    } else {
+      const distance = camera.position.length();
+      const cosPolar = camera.position.y / distance;
+      mesh.visible = !(distance < HIDE_DISTANCE && cosPolar > Math.cos(HIDE_MAX_POLAR_ANGLE));
+    }
   });
 
   if (!mesh) return null;
